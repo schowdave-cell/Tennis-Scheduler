@@ -1,0 +1,11 @@
+Name,Level,Preference,Partner,Opponent,Avoid
+Alice,3.5,Doubles,Beth,,Carl
+Beth,5.0,Doubles,Alice,,
+Carl,4.0,Singles,,Dave,
+Dave,4.0,Singles,,Carl,
+Evan,3.0,Either,,,
+Frank,3.0,Either,,,
+Grace,3.5,Doubles,Heidi,,
+Heidi,3.5,Doubles,Grace,,
+Ivan,4.0,Either,,,
+Jack,3.0,Either,,,
