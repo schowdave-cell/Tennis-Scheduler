@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import random
 import io
+import requests
 
 # ─────────────────────────────────────────────
 # Page config
@@ -346,11 +347,29 @@ def load_players(df):
         name = clean_str(row.get("Name", ""))
         if not name:
             continue
-        raw_level = row[level_col] if level_col and level_col in row.index else 3.5
+
+        # Filter out legend/instruction rows — real player names are short
+        # and parse_level on their Level cell should succeed
+        raw_level = row[level_col] if level_col and level_col in row.index else ""
+        level = parse_level(raw_level)
+
+        # Skip rows where name is suspiciously long (legend text) or level didn't parse
+        if len(name) > 50:
+            continue
+        if str(raw_level).strip() == "" or level == 3.5 and not str(raw_level).strip().replace(".", "").isdigit():
+            # Level is blank — only accept if name looks like a real name (short, no emoji)
+            if len(name) > 30 or any(ord(c) > 127 for c in name):
+                continue
+
+        # Preference: default to "Either" if blank
+        pref = clean_str(find_col(row, "Preference")).capitalize()
+        if pref not in ("Singles", "Doubles", "Either"):
+            pref = "Either"
+
         players.append({
             "name": name,
-            "level": parse_level(raw_level),
-            "pref": clean_str(find_col(row, "Preference")).capitalize() or "Either",
+            "level": level,
+            "pref": pref,
             "partner": clean_str(find_col(row, "Fixed Partner", "Partner")),
             "opponent": clean_str(find_col(row, "Fixed Opponent", "Opponent")),
             "avoid": clean_str(find_col(row, "Avoid")),
@@ -559,10 +578,10 @@ def assign_round1(players, rng=None, max_courts=None):
     n = len(players)
     # How many courts do we need with normal singles/doubles split?
     n_singles_pref = sum(1 for p in players if p["pref"] == "Singles")
-    # Pairs of singles players = courts needed for singles
     singles_courts_needed = n_singles_pref // 2
     remaining_after_singles = n - (singles_courts_needed * 2)
     doubles_courts_needed = remaining_after_singles // 4
+    # Leftover players (1-3) either get a bye or fold into singles — no extra court
     total_courts_needed = singles_courts_needed + doubles_courts_needed
 
     # If no court limit or we fit within it, run normally
@@ -570,7 +589,7 @@ def assign_round1(players, rng=None, max_courts=None):
     on_deck = []
     active_players = list(players)
 
-    if max_courts and max_courts < total_courts_needed:
+    if max_courts and total_courts_needed > max_courts:
         force_all_doubles = True
         max_players = max_courts * 4
         if n > max_players:
@@ -657,7 +676,7 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None, max
     doubles_courts_needed = remaining_after_singles // 4
     total_courts_needed = singles_courts_needed + doubles_courts_needed
 
-    if max_courts and max_courts < total_courts_needed:
+    if max_courts and total_courts_needed > max_courts:
         force_all_doubles = True
         max_players = max_courts * 4
         if n > max_players:
@@ -765,6 +784,80 @@ def export_text(r1_courts, r1_byes, r2_courts, r2_byes):
         lines.append(f"On Deck: {', '.join(p['name'] for p in r2_byes)}")
     return "\n".join(lines)
 
+def sheets_url_to_csv(url, sheet_name="Session"):
+    """
+    Convert any Google Sheets sharing URL to a direct CSV export URL.
+    Supports:
+      - Standard share URL: .../spreadsheets/d/SHEET_ID/edit?...
+      - Already a gviz/tq URL
+    Returns the CSV export URL string.
+    """
+    import re
+    # Extract the sheet ID
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    if not match:
+        raise ValueError("Could not find a Google Sheets ID in the URL. Make sure you're pasting the sharing link.")
+    sheet_id = match.group(1)
+    return (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        f"/gviz/tq?tqx=out:csv&sheet={requests.utils.quote(sheet_name)}"
+    )
+
+def fetch_sheet_as_df(url, sheet_name="Session"):
+    """Fetch a Google Sheet tab as a DataFrame. Raises on any error."""
+    import csv as csv_module
+
+    csv_url = sheets_url_to_csv(url, sheet_name)
+    resp = requests.get(csv_url, timeout=10)
+    if resp.status_code == 403:
+        raise PermissionError(
+            "Sheet returned 403 Forbidden. Make sure sharing is set to 'Anyone with the link can view'."
+        )
+    resp.raise_for_status()
+    raw = resp.text
+
+    # Parse all rows properly using Python's CSV reader (handles quoted commas correctly)
+    reader = csv_module.reader(io.StringIO(raw))
+    all_rows = list(reader)
+
+    # Find the header row: the one where any cell is exactly "Name"
+    # and another cell is "Level" or "USTA Level"
+    header_idx = None
+    for i, row in enumerate(all_rows):
+        cells = [c.strip() for c in row]
+        level_cols = ("Level", "USTA Level")
+        has_level = any(c in level_cols for c in cells)
+        # Name may be its own cell, or appended to the end of a merged title cell
+        name_cell_idx = None
+        for j, c in enumerate(cells):
+            if c == "Name" or c.endswith("Name"):
+                name_cell_idx = j
+                break
+        if name_cell_idx is not None and has_level:
+            # If Name is embedded in a longer string, trim the cell to just "Name"
+            cells[name_cell_idx] = "Name"
+            header_idx = i
+            # Replace all_rows with cleaned header + data rows
+            all_rows[i] = cells
+            break
+
+    if header_idx is None:
+        raise ValueError(
+            "Could not find a 'Name' and 'Level' header row in the sheet. "
+            "Check that the Session tab has these column headers."
+        )
+
+    headers = all_rows[header_idx]
+    data_rows = all_rows[header_idx + 1:]
+
+    # Build DataFrame directly from parsed rows — no CSV re-parsing needed
+    df = pd.DataFrame(data_rows, columns=headers)
+
+    # Drop blank-name rows (empty dropdown slots)
+    df = df[df["Name"].notna() & (df["Name"].astype(str).str.strip() != "")]
+    df = df.reset_index(drop=True)
+    return df
+
 # ─────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────
@@ -772,7 +865,7 @@ def export_text(r1_courts, r1_byes, r2_courts, r2_byes):
 st.markdown("""
 <div class="hero">
     <h1>Tennis Drop-In Scheduler</h1>
-    <p>Upload your player CSV → get balanced, constraint-safe court assignments in seconds.</p>
+    <p>Connect your Google Sheet or upload a CSV → get balanced court assignments in seconds.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -781,22 +874,36 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     if "seed" not in st.session_state:
         st.session_state.seed = 42
+    if "sheet_url" not in st.session_state:
+        st.session_state.sheet_url = ""
+
     max_courts = st.number_input("🎾 Number of courts available", min_value=1, max_value=20, value=10,
         help="Maximum courts in use per round. If players exceed court capacity, all matches become doubles and overflow players are shown as On Deck.")
     balance_threshold = st.slider("⚖️ Balance warning threshold (rating gap)", min_value=0.0, max_value=2.0, value=0.5, step=0.25,
         help="Courts where the level gap exceeds this will show a warning flag. Does not affect scheduling.")
     st.markdown("---")
-    st.markdown("### 📋 CSV Format")
-    st.markdown("""
-Your CSV must have these columns:
-- **Name** *(required)*
-- **Level** *(or "USTA Level" — e.g. 3.5)*
-- **Preference** *(Singles / Doubles / Either)*
-- **Partner** *(or "Fixed Partner", optional)*
-- **Opponent** *(or "Fixed Opponent", optional, Round 1 only)*
-- **Avoid** *(optional, reserved)*
-    """)
+
+    st.markdown("### 🔗 Google Sheet")
+    sheet_url_input = st.text_input(
+        "Paste sharing URL",
+        value=st.session_state.sheet_url,
+        placeholder="https://docs.google.com/spreadsheets/d/...",
+        help="Paste the Google Sheet sharing link. The sheet must be shared as 'Anyone with the link can view'. The app reads the 'Session' tab automatically.",
+    )
+    if sheet_url_input != st.session_state.sheet_url:
+        st.session_state.sheet_url = sheet_url_input
+
     st.markdown("---")
+    st.markdown("### 📋 CSV Fallback")
+    st.markdown("""
+Columns needed:
+- **Name** *(required)*
+- **Level** *(e.g. 3.5)*
+- **Preference** *(Singles / Doubles / Either)*
+- **Partner** *(optional)*
+- **Opponent** *(optional, Round 1 only)*
+- **Avoid** *(optional)*
+    """)
 
     # Sample CSV download
     sample_data = pd.DataFrame([
@@ -812,17 +919,49 @@ Your CSV must have these columns:
     csv_bytes = sample_data.to_csv(index=False).encode()
     st.download_button("📥 Download Sample CSV", data=csv_bytes, file_name="sample_players.csv", mime="text/csv")
 
-# File upload
-uploaded = st.file_uploader("Upload Player CSV", type=["csv"])
+# ── Data source: Google Sheet takes priority, then CSV upload ──
+df = None
+source_label = None
 
-if uploaded:
+if st.session_state.sheet_url:
     try:
-        df = pd.read_csv(uploaded)
+        df = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Session")
+        source_label = "📊 Loaded from Google Sheet"
+    except PermissionError as e:
+        st.markdown(f'<div class="warning-box">🔒 {e}</div>', unsafe_allow_html=True)
+    except ValueError as e:
+        st.markdown(f'<div class="warning-box">⚠️ {e}</div>', unsafe_allow_html=True)
+    except Exception as e:
+        st.markdown(f'<div class="warning-box">❌ Could not load sheet: {e}</div>', unsafe_allow_html=True)
+
+if df is None:
+    uploaded = st.file_uploader("Or upload a CSV file", type=["csv"])
+    if uploaded:
+        try:
+            df = pd.read_csv(uploaded)
+            source_label = "📁 Loaded from CSV upload"
+        except Exception as e:
+            st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
+else:
+    # Still show uploader collapsed so organizer can override if needed
+    with st.expander("Or upload a CSV instead"):
+        uploaded_override = st.file_uploader("Upload CSV (overrides Google Sheet)", type=["csv"])
+        if uploaded_override:
+            try:
+                df = pd.read_csv(uploaded_override)
+                source_label = "📁 Loaded from CSV upload (override)"
+            except Exception as e:
+                st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
+
+if df is not None:
+    try:
         players = load_players(df)
 
         if not players:
-            st.markdown('<div class="warning-box">⚠️ No valid players found. Check your CSV format.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="warning-box">⚠️ No valid players found. Check your CSV or Sheet format.</div>', unsafe_allow_html=True)
             st.stop()
+
+        st.markdown(f'<div class="success-box">{source_label} — {len(players)} players found.</div>', unsafe_allow_html=True)
 
         # Stats bar
         n_singles = sum(1 for p in players if p["pref"] == "Singles")
@@ -943,13 +1082,13 @@ if uploaded:
             )
 
     except Exception as e:
-        st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="warning-box">❌ Error processing player data: {e}</div>', unsafe_allow_html=True)
 
 else:
     st.markdown("""
     <div style="text-align:center; padding: 3rem; color: #8b949e;">
-        <div style="font-size: 3rem; margin-bottom: 1rem;">📁</div>
-        <div style="font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: 2px; color: #4ade80;">Upload a CSV to get started</div>
-        <div style="font-size: 0.9rem; margin-top: 0.5rem;">Download the sample CSV from the sidebar to see the expected format.</div>
+        <div style="font-size: 3rem; margin-bottom: 1rem;">🎾</div>
+        <div style="font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: 2px; color: #4ade80;">Ready when you are</div>
+        <div style="font-size: 0.9rem; margin-top: 0.5rem; color: #c9d1d9;">Paste a Google Sheet URL in the sidebar, or upload a CSV file below.</div>
     </div>
     """, unsafe_allow_html=True)
