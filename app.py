@@ -334,7 +334,7 @@ def find_col(row, *candidates):
     """Return the first matching column value from a list of candidate names."""
     for c in candidates:
         if c in row.index and not pd.isna(row[c]) and str(row[c]).strip() != "":
-            return row[c]
+            return str(row[c])
     return ""
 
 def load_players(df):
@@ -348,18 +348,12 @@ def load_players(df):
         if not name:
             continue
 
-        # Filter out legend/instruction rows — real player names are short
-        # and parse_level on their Level cell should succeed
+        # Filter out legend/instruction rows — only reject names with emoji or > 50 chars
         raw_level = row[level_col] if level_col and level_col in row.index else ""
         level = parse_level(raw_level)
 
-        # Skip rows where name is suspiciously long (legend text) or level didn't parse
-        if len(name) > 50:
+        if len(name) > 50 or any(ord(c) > 127 for c in name):
             continue
-        if str(raw_level).strip() == "" or level == 3.5 and not str(raw_level).strip().replace(".", "").isdigit():
-            # Level is blank — only accept if name looks like a real name (short, no emoji)
-            if len(name) > 30 or any(ord(c) > 127 for c in name):
-                continue
 
         # Preference: default to "Either" if blank
         pref = clean_str(find_col(row, "Preference")).capitalize()
@@ -400,13 +394,14 @@ def match_key(t1, t2):
         frozenset(p["name"] for p in t2),
     ])
 
-def form_teams(pool, rng=None, avoid_partners=None):
+def form_teams(pool, rng=None, r1_rng=None, avoid_partners=None):
     """
     Phase 1: Form teams of 2 from the pool.
     - Fixed partner pairs become teams immediately (always, both rounds).
     - Free players are paired by closest level (Round 1) or shuffled (Round 2).
+    - r1_rng: used in Round 1 to shuffle free players before level-sort pairing,
+      so the leftover player rotates on each click rather than always being the same.
     - avoid_partners: set of frozensets {name_a, name_b} to avoid re-pairing in Round 2.
-      Soft constraint — respected if a valid alternative exists, ignored otherwise.
     Returns list of teams (each a list of 2 players) and leftover players (0 or 1).
     """
     avoid_partners = avoid_partners or set()
@@ -414,7 +409,7 @@ def form_teams(pool, rng=None, avoid_partners=None):
     used = set()
     teams = []
 
-    # Lock fixed partner pairs first — never affected by avoid_partners
+    # Lock fixed partner pairs first
     for p in remaining:
         if p["name"] in used or not p["partner"]:
             continue
@@ -429,27 +424,76 @@ def form_teams(pool, rng=None, avoid_partners=None):
     if rng:
         rng.shuffle(free)
     else:
+        # Round 1: sort by level for best pairing, but shuffle same-level players
+        # using r1_rng so the leftover rotates each click
+        if r1_rng:
+            r1_rng.shuffle(free)
         free.sort(key=lambda x: x["level"])
 
-    # Greedy pairing of free players, avoiding Round 1 partners where possible.
-    # For each unpaired player, find the best available partner:
-    #   prefer (not a repeat partner, closest level) over (repeat partner, closest level)
     unpaired = list(free)
-    while len(unpaired) >= 2:
-        p = unpaired.pop(0)
-        best_idx = None
-        best_score = None
-        for i, candidate in enumerate(unpaired):
-            gap = abs(p["level"] - candidate["level"])
-            is_repeat = frozenset([p["name"], candidate["name"]]) in avoid_partners
-            score = (1 if is_repeat else 0, gap)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_idx = i
-        partner = unpaired.pop(best_idx)
-        teams.append([p, partner])
 
-    leftover = unpaired  # 0 or 1 player remaining
+    if len(unpaired) % 2 == 1 and not rng:
+        # Round 1 with odd free players: try each player as the sit-out and pick
+        # the arrangement that produces the best overall level balance.
+        # This prevents the same isolated-level player from always sitting out.
+        best_teams = None
+        best_score = float("inf")
+        best_leftover = None
+
+        for sit_out_idx in range(len(unpaired)):
+            candidate_leftover = unpaired[sit_out_idx]
+            candidate_pool = unpaired[:sit_out_idx] + unpaired[sit_out_idx+1:]
+            candidate_teams = []
+            pool_sorted = sorted(candidate_pool, key=lambda x: x["level"])
+            i = 0
+            while i + 1 < len(pool_sorted):
+                candidate_teams.append([pool_sorted[i], pool_sorted[i+1]])
+                i += 2
+            # Score = total intra-team level gap
+            score = sum(abs(t[0]["level"] - t[1]["level"]) for t in candidate_teams)
+            if score < best_score:
+                best_score = score
+                best_teams = candidate_teams
+                best_leftover = [candidate_leftover]
+
+        # Among equally-scored options, r1_rng picks randomly
+        if r1_rng:
+            best_options = []
+            for sit_out_idx in range(len(unpaired)):
+                candidate_leftover = unpaired[sit_out_idx]
+                candidate_pool = unpaired[:sit_out_idx] + unpaired[sit_out_idx+1:]
+                pool_sorted = sorted(candidate_pool, key=lambda x: x["level"])
+                score = sum(abs(pool_sorted[i]["level"] - pool_sorted[i+1]["level"])
+                           for i in range(0, len(pool_sorted)-1, 2))
+                if abs(score - best_score) < 0.001:
+                    best_options.append(sit_out_idx)
+            sit_out_idx = r1_rng.choice(best_options)
+            best_leftover = [unpaired[sit_out_idx]]
+            candidate_pool = unpaired[:sit_out_idx] + unpaired[sit_out_idx+1:]
+            pool_sorted = sorted(candidate_pool, key=lambda x: x["level"])
+            best_teams = []
+            i = 0
+            while i + 1 < len(pool_sorted):
+                best_teams.append([pool_sorted[i], pool_sorted[i+1]])
+                i += 2
+
+        teams.extend(best_teams)
+        leftover = best_leftover
+    else:
+        while len(unpaired) >= 2:
+            p = unpaired.pop(0)
+            best_idx = None
+            best_score = None
+            for i, candidate in enumerate(unpaired):
+                gap = abs(p["level"] - candidate["level"])
+                is_repeat = frozenset([p["name"], candidate["name"]]) in avoid_partners
+                score = (1 if is_repeat else 0, gap)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_idx = i
+            partner = unpaired.pop(best_idx)
+            teams.append([p, partner])
+        leftover = unpaired
     return teams, leftover
 
 
@@ -474,9 +518,20 @@ def optimal_match_teams(teams, rng=None):
 
     leftover_teams = []
     if len(remaining) % 2 == 1:
-        remaining.sort(key=lambda t: avg_level(t))
-        mid = len(remaining) // 2
-        leftover_teams = [remaining.pop(mid)]
+        if rng:
+            # Pick randomly among the middle third of teams by level to keep balance
+            # while still rotating who sits out
+            remaining_sorted = sorted(remaining, key=lambda t: avg_level(t))
+            n = len(remaining_sorted)
+            lo, hi = max(0, n//3), min(n-1, 2*n//3)
+            sit_out_idx = rng.randint(lo, hi)
+            sit_out = remaining_sorted[sit_out_idx]
+            remaining = [t for t in remaining if t is not sit_out]
+            leftover_teams = [sit_out]
+        else:
+            remaining.sort(key=lambda t: avg_level(t))
+            mid = len(remaining) // 2
+            leftover_teams = [remaining.pop(mid)]
 
     if not remaining:
         return [], leftover_teams
@@ -532,23 +587,53 @@ def greedy_match_teams(teams, avoid_matchups=None):
     return matches, leftover_teams
 
 
+def optimize_court_balance(matches):
+    """
+    Post-matching optimization: for each court, try all single-player swaps
+    between the two teams and keep the swap if it reduces the team avg gap.
+    Respects fixed partners — never splits a fixed pair.
+    """
+    optimized = []
+    for t1, t2 in matches:
+        best_t1, best_t2 = t1, t2
+        best_gap = abs(avg_level(t1) - avg_level(t2))
+
+        # Try swapping each player in t1 with each player in t2
+        for i, p1 in enumerate(t1):
+            for j, p2 in enumerate(t2):
+                # Don't swap fixed partners apart
+                if p1.get("partner") or p2.get("partner"):
+                    continue
+                new_t1 = [p if k != i else p2 for k, p in enumerate(t1)]
+                new_t2 = [p if k != j else p1 for k, p in enumerate(t2)]
+                gap = abs(avg_level(new_t1) - avg_level(new_t2))
+                if gap < best_gap - 0.001:  # small epsilon to avoid floating point churn
+                    best_gap = gap
+                    best_t1, best_t2 = new_t1, new_t2
+
+        optimized.append((best_t1, best_t2))
+    return optimized
+
+
 def make_doubles_matches(pool, fixed_partners, rng=None, r1_rng=None, avoid_matchups=None, avoid_partners=None):
     """
     Form doubles matches from pool using two-phase approach:
       Phase 1 — form_teams: lock fixed pairs, pair free players by level (avoid R1 partners)
-      Phase 2 — match teams:
-        Round 1 (rng=None): optimal global matching to minimize total level gap
-        Round 2 (rng set):  greedy matching, also avoids R1 opponent repeats
+      Phase 2 — match teams: optimal (R1) or greedy (R2) to minimize cross-team gap
+      Phase 3 — optimize_court_balance: single-player swaps to further improve balance
     Scales efficiently to 25+ players.
     """
     avoid_matchups = avoid_matchups or set()
 
-    teams, leftover_players = form_teams(pool, rng=rng, avoid_partners=avoid_partners)
+    teams, leftover_players = form_teams(pool, rng=rng, r1_rng=r1_rng, avoid_partners=avoid_partners)
 
     if rng is None:
         matches, leftover_teams = optimal_match_teams(teams, rng=r1_rng)
     else:
         matches, leftover_teams = greedy_match_teams(teams, avoid_matchups=avoid_matchups)
+
+    # Phase 3: fine-tune balance by trying single-player swaps within each court
+    matches = optimize_court_balance(matches)
 
     leftover = [p for team in leftover_teams for p in team] + leftover_players
     return matches, leftover
@@ -624,20 +709,24 @@ def assign_round1(players, rng=None, max_courts=None):
         for m in s_matches:
             used.add(m[0]["name"])
             used.add(m[1]["name"])
-        for p in s_leftover:
-            used.add(p["name"])
-            on_deck.append(p)
+        # Don't put singles leftovers on deck yet — hold for pairing with doubles leftovers
 
-        doubles_pool = [p for p in active_players if p["name"] not in used]
+        doubles_pool = [p for p in active_players if p["name"] not in used and p not in s_leftover]
         d_matches, d_leftover = make_doubles_matches(doubles_pool, {}, rng=None, r1_rng=rng)
         doubles_matches.extend(d_matches)
         for m in d_matches:
             for t in m:
                 for pl in t:
                     used.add(pl["name"])
-        if d_leftover:
-            extra_s, extra_bye = make_singles_matches(d_leftover)
+
+        # Combine all leftovers and try singles before on_deck
+        all_leftover = s_leftover + d_leftover
+        if all_leftover:
+            extra_s, extra_bye = make_singles_matches(all_leftover)
             singles_matches.extend(extra_s)
+            for m in extra_s:
+                used.add(m[0]["name"])
+                used.add(m[1]["name"])
             on_deck.extend(extra_bye)
     else:
         # Court-constrained: all doubles, no singles
@@ -647,7 +736,11 @@ def assign_round1(players, rng=None, max_courts=None):
             for t in m:
                 for pl in t:
                     used.add(pl["name"])
-        on_deck.extend(d_leftover)
+        if d_leftover:
+            # Even in court-constrained mode, 2 leftovers can play singles
+            extra_s, extra_bye = make_singles_matches(d_leftover)
+            singles_matches.extend(extra_s)
+            on_deck.extend(extra_bye)
 
     r1_matchup_keys = {match_key(t1, t2) for t1, t2 in doubles_matches}
     r1_partner_pairs = set()
@@ -656,20 +749,68 @@ def assign_round1(players, rng=None, max_courts=None):
             if not any(p["partner"] for p in team):
                 r1_partner_pairs.add(frozenset(p["name"] for p in team))
 
-    return singles_matches, doubles_matches, on_deck, r1_matchup_keys, r1_partner_pairs
+    # Track singles matchups to detect repeats in Round 2
+    r1_singles_keys = {frozenset([m[0]["name"], m[1]["name"]]) for m in singles_matches}
+
+    return singles_matches, doubles_matches, on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys
 
 
-def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None, max_courts=None):
+def either_singles_rotation(singles_players, either_players, r1_singles_keys, rng=None):
+    """
+    If Round 1 singles matchup would repeat, pull 4 Either players in to create
+    3 new singles matches. Uses rng to shuffle among equal-level candidates so
+    the selection rotates on each click.
+    """
+    if len(singles_players) != 2:
+        return [], [], False
+    p1, p2 = singles_players
+    would_repeat = frozenset([p1["name"], p2["name"]]) in r1_singles_keys
+    if not would_repeat:
+        return [], [], False
+    if len(either_players) < 4:
+        return [], [], False
+
+    available = list(either_players)
+    # Shuffle first so equal-level players rotate each click
+    if rng:
+        rng.shuffle(available)
+
+    available.sort(key=lambda e: abs(e["level"] - p1["level"]))
+    either_a = available.pop(0)
+
+    available.sort(key=lambda e: abs(e["level"] - p2["level"]))
+    either_b = available.pop(0)
+
+    best_pair = None
+    best_gap = float("inf")
+    for i in range(len(available)):
+        for j in range(i+1, len(available)):
+            gap = abs(available[i]["level"] - available[j]["level"])
+            if gap < best_gap:
+                best_gap = gap
+                best_pair = (available[i], available[j])
+
+    if best_pair is None:
+        return [], [], False
+
+    either_c, either_d = best_pair
+    new_singles = [(p1, either_a), (p2, either_b), (either_c, either_d)]
+    used_either = [either_a, either_b, either_c, either_d]
+    return new_singles, used_either, True
+
+
+def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
+                  r1_singles_keys=None, max_courts=None):
     """
     Round 2: reshuffle, no fixed opponent constraint.
     Respects court limit. Forces all-doubles if court-constrained.
+    If singles matchup would repeat, pulls 4 Either players in for 3 singles matches.
     """
     n = len(players)
     force_all_doubles = False
     on_deck = []
     active_players = list(players)
 
-    # Estimate courts needed (no singles pref check — round 2 ignores fixed opponents)
     n_singles_pref = sum(1 for p in players if p["pref"] == "Singles")
     singles_courts_needed = n_singles_pref // 2
     remaining_after_singles = n - (singles_courts_needed * 2)
@@ -693,17 +834,30 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None, max
 
     if not force_all_doubles:
         singles_pool = [p for p in active_players if p["pref"] == "Singles"]
-        singles_pool.sort(key=lambda x: x["level"])
-        s_matches, s_leftover = make_singles_matches(singles_pool)
-        singles_matches.extend(s_matches)
-        for m in s_matches:
-            used.add(m[0]["name"])
-            used.add(m[1]["name"])
-        for p in s_leftover:
-            used.add(p["name"])
-            on_deck.append(p)
+        either_pool = [p for p in active_players
+                       if p["pref"] in ("Either", "Doubles") and not p["partner"]]
 
-        doubles_pool = [p for p in active_players if p["name"] not in used]
+        new_singles, used_either, rotated = either_singles_rotation(
+            singles_pool, either_pool, r1_singles_keys or set(), rng=rng
+        )
+
+        if rotated:
+            singles_matches.extend(new_singles)
+            for m in new_singles:
+                used.add(m[0]["name"])
+                used.add(m[1]["name"])
+            doubles_pool = [p for p in active_players if p["name"] not in used]
+            s_leftover = []
+        else:
+            singles_pool.sort(key=lambda x: x["level"])
+            s_matches, s_leftover = make_singles_matches(singles_pool)
+            singles_matches.extend(s_matches)
+            for m in s_matches:
+                used.add(m[0]["name"])
+                used.add(m[1]["name"])
+            doubles_pool = [p for p in active_players
+                            if p["name"] not in used and p not in s_leftover]
+
         d_matches, d_leftover = make_doubles_matches(
             doubles_pool, {}, rng=rng,
             avoid_matchups=r1_matchup_keys,
@@ -714,9 +868,15 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None, max
             for t in m:
                 for pl in t:
                     used.add(pl["name"])
-        if d_leftover:
-            extra_s, extra_bye = make_singles_matches(d_leftover)
+
+        all_leftover = s_leftover + d_leftover
+        if all_leftover:
+            rng.shuffle(all_leftover)
+            extra_s, extra_bye = make_singles_matches(all_leftover)
             singles_matches.extend(extra_s)
+            for m in extra_s:
+                used.add(m[0]["name"])
+                used.add(m[1]["name"])
             on_deck.extend(extra_bye)
     else:
         d_matches, d_leftover = make_doubles_matches(
@@ -729,7 +889,10 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None, max
             for t in m:
                 for pl in t:
                     used.add(pl["name"])
-        on_deck.extend(d_leftover)
+        if d_leftover:
+            extra_s, extra_bye = make_singles_matches(d_leftover)
+            singles_matches.extend(extra_s)
+            on_deck.extend(extra_bye)
 
     return singles_matches, doubles_matches, on_deck
 
@@ -825,33 +988,34 @@ def fetch_sheet_as_df(url, sheet_name="Session"):
     header_idx = None
     for i, row in enumerate(all_rows):
         cells = [c.strip() for c in row]
-        level_cols = ("Level", "USTA Level")
-        has_level = any(c in level_cols for c in cells)
-        # Name may be its own cell, or appended to the end of a merged title cell
+        # Only require "Name" — Level may not exist in Session tab anymore
         name_cell_idx = None
         for j, c in enumerate(cells):
-            if c == "Name" or c.endswith("Name"):
+            if c == "Name" or (c.endswith("Name") and len(c) > 4):
                 name_cell_idx = j
                 break
-        if name_cell_idx is not None and has_level:
-            # If Name is embedded in a longer string, trim the cell to just "Name"
-            cells[name_cell_idx] = "Name"
+        if name_cell_idx is not None:
+            # If Name is embedded in a longer string, trim to just "Name"
+            if cells[name_cell_idx] != "Name":
+                cells[name_cell_idx] = "Name"
             header_idx = i
-            # Replace all_rows with cleaned header + data rows
             all_rows[i] = cells
             break
 
     if header_idx is None:
         raise ValueError(
-            "Could not find a 'Name' and 'Level' header row in the sheet. "
-            "Check that the Session tab has these column headers."
+            "Could not find a 'Name' header row in the sheet. "
+            "Check that the Session tab has a 'Name' column header."
         )
 
     headers = all_rows[header_idx]
     data_rows = all_rows[header_idx + 1:]
 
-    # Build DataFrame directly from parsed rows — no CSV re-parsing needed
+    # Build DataFrame — all values come from csv.reader as strings already
     df = pd.DataFrame(data_rows, columns=headers)
+    # Ensure all columns are string type to prevent type inference issues
+    for col in df.columns:
+        df[col] = df[col].astype(str)
 
     # Drop blank-name rows (empty dropdown slots)
     df = df[df["Name"].notna() & (df["Name"].astype(str).str.strip() != "")]
@@ -926,6 +1090,50 @@ source_label = None
 if st.session_state.sheet_url:
     try:
         df = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Session")
+        # Also fetch Master Players to get accurate levels —
+        # VLOOKUP formulas in Session tab don't evaluate in CSV export
+        try:
+            df_master = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Master Players")
+            level_col_master = find_level_column(df_master)
+            if level_col_master and "Name" in df_master.columns:
+                master_levels = {}
+                master_prefs = {}
+                master_partners = {}
+                for _, row in df_master.iterrows():
+                    n = clean_str(str(row.get("Name", "")))
+                    if n:
+                        master_levels[n] = parse_level(str(row[level_col_master]))
+                        master_prefs[n] = clean_str(find_col(row, "Default Preference", "Preference"))
+                        master_partners[n] = clean_str(find_col(row, "Default Partner", "Partner"))
+
+                # Ensure Level, Preference, Partner columns exist in session df
+                # (they may have been removed from the sheet)
+                level_col_session = find_level_column(df)
+                if not level_col_session:
+                    df["Level"] = ""
+                    level_col_session = "Level"
+                if "Preference" not in df.columns:
+                    df["Preference"] = ""
+                if "Partner" not in df.columns:
+                    df["Partner"] = ""
+
+                # Apply master data — always use master level; use master pref/partner
+                # only when session field is blank (allows per-session overrides)
+                for idx, row in df.iterrows():
+                    n = clean_str(str(row.get("Name", "")))
+                    if n in master_levels:
+                        # Level always comes from master — store as string
+                        df.at[idx, level_col_session] = str(master_levels[n])
+                        # Preference: use session value if set, else master default
+                        cur_pref = str(df.at[idx, "Preference"]).strip()
+                        if cur_pref == "" or cur_pref == "nan":
+                            df.at[idx, "Preference"] = master_prefs.get(n, "Either")
+                        # Partner: use session value if set, else master default
+                        cur_partner = str(df.at[idx, "Partner"]).strip()
+                        if cur_partner == "" or cur_partner == "nan":
+                            df.at[idx, "Partner"] = master_partners.get(n, "")
+        except Exception as master_err:
+            st.markdown(f'<div class="warning-box">⚠️ Could not load Master Players tab: {master_err} — levels will default to 3.5</div>', unsafe_allow_html=True)
         source_label = "📊 Loaded from Google Sheet"
     except PermissionError as e:
         st.markdown(f'<div class="warning-box">🔒 {e}</div>', unsafe_allow_html=True)
@@ -1001,11 +1209,11 @@ if df is not None:
             rng = random.Random(seed)
 
             # Round 1 — optimal matching; rng used only for tie-breaking
-            r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs = assign_round1(players, rng=rng, max_courts=max_courts)
+            r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys = assign_round1(players, rng=rng, max_courts=max_courts)
             r1_courts, _ = render_schedule(r1_singles, r1_doubles, [], 1, balance_threshold)
 
             # Round 2 — reshuffled, avoids repeating R1 opponents and partners where possible
-            r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, max_courts=max_courts)
+            r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts)
             r2_courts, _ = render_schedule(r2_singles, r2_doubles, [], 2, balance_threshold)
 
             # Verify all players appear (on court or on deck)
