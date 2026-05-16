@@ -11,6 +11,7 @@ st.set_page_config(
     page_title="Tennis Drop-In Scheduler",
     page_icon="🎾",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 # ─────────────────────────────────────────────
@@ -208,6 +209,21 @@ h1, h2, h3 {
     width: 100%;
     cursor: pointer;
     transition: all 0.2s;
+    white-space: nowrap;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+/* Hide sidebar collapse/expand button — try all known selectors */
+[data-testid="collapsedControl"],
+[data-testid="baseButton-headerNoPadding"],
+button[kind="header"],
+section[data-testid="stSidebar"] > div > button,
+.st-emotion-cache-h4xjwg,
+.st-emotion-cache-1rtdyuf {
+    display: none !important;
+    visibility: hidden !important;
 }
 
 .stButton > button:hover {
@@ -289,10 +305,79 @@ input[type="number"], input[type="text"], input {
     background-color: #21262d !important;
 }
 
+/* Fix +/- buttons on number input */
+[data-testid="stNumberInput"] button {
+    color: #e6edf3 !important;
+    background-color: #30363d !important;
+    border: 1px solid #444d56 !important;
+}
+
+[data-testid="stNumberInput"] button:hover {
+    background-color: #444d56 !important;
+    color: #4ade80 !important;
+}
+
+[data-testid="stNumberInput"] button svg {
+    fill: #e6edf3 !important;
+    stroke: #e6edf3 !important;
+}
+
 /* Fix all form element text in sidebar */
 [data-testid="stSidebar"] input {
     color: #e6edf3 !important;
     background-color: #21262d !important;
+}
+
+/* Fix expander — prevent white background, fix text color */
+[data-testid="stExpander"] {
+    background-color: #161b22 !important;
+    border: 1px solid #30363d !important;
+    border-radius: 8px !important;
+}
+
+[data-testid="stExpander"] summary {
+    background-color: #161b22 !important;
+    color: #e6edf3 !important;
+}
+
+[data-testid="stExpander"] summary:hover {
+    background-color: #21262d !important;
+}
+
+[data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary span,
+[data-testid="stExpander"] p {
+    color: #e6edf3 !important;
+}
+
+/* Fix file uploader */
+[data-testid="stFileUploader"] {
+    background-color: #161b22 !important;
+    border: 2px dashed #30363d !important;
+    border-radius: 12px !important;
+}
+
+[data-testid="stFileUploader"] * {
+    color: #e6edf3 !important;
+}
+
+[data-testid="stFileUploader"] button {
+    background-color: #21262d !important;
+    color: #e6edf3 !important;
+    border: 1px solid #30363d !important;
+}
+
+[data-testid="stFileUploader"] small,
+[data-testid="stFileUploader"] span {
+    color: #8b949e !important;
+}
+
+[data-testid="stFileUploaderDropzone"] {
+    background-color: #161b22 !important;
+}
+
+[data-testid="stFileUploaderDropzoneInstructions"] {
+    color: #c9d1d9 !important;
 }
 
 
@@ -1045,43 +1130,61 @@ with st.sidebar:
         help="Maximum courts in use per round. If players exceed court capacity, all matches become doubles and overflow players are shown as On Deck.")
     balance_threshold = st.slider("⚖️ Balance warning threshold (rating gap)", min_value=0.0, max_value=2.0, value=0.5, step=0.25,
         help="Courts where the level gap exceeds this will show a warning flag. Does not affect scheduling.")
-    st.markdown("---")
 
-    st.markdown("### 🔗 Google Sheet")
-    sheet_url_input = st.text_input(
-        "Paste sharing URL",
-        value=st.session_state.sheet_url,
-        placeholder="https://docs.google.com/spreadsheets/d/...",
-        help="Paste the Google Sheet sharing link. The sheet must be shared as 'Anyone with the link can view'. The app reads the 'Session' tab automatically.",
-    )
-    if sheet_url_input != st.session_state.sheet_url:
+# ── Unified data source section ──
+st.markdown("---")
+st.markdown("### 📡 Connect Your Player Data")
+
+col_url, col_csv = st.columns([3, 2])
+
+with col_url:
+    st.markdown("**🔗 Google Sheet URL**")
+    st.caption("Paste your sharing link — the app reads the Session and Master Players tabs automatically. Sheet must be shared as 'Anyone with the link can view'.")
+    url_col, btn_col = st.columns([6, 1])
+    with url_col:
+        sheet_url_input = st.text_input(
+            "Google Sheet URL",
+            value=st.session_state.sheet_url,
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            label_visibility="collapsed",
+        )
+    with btn_col:
+        load_clicked = st.button("Load", use_container_width=True)
+
+    if load_clicked and sheet_url_input:
+        st.session_state.sheet_url = sheet_url_input
+    elif sheet_url_input != st.session_state.sheet_url:
         st.session_state.sheet_url = sheet_url_input
 
-    st.markdown("---")
-    st.markdown("### 📋 CSV Fallback")
     st.markdown("""
-Columns needed:
-- **Name** *(required)*
-- **Level** *(e.g. 3.5)*
-- **Preference** *(Singles / Doubles / Either)*
-- **Partner** *(optional)*
-- **Opponent** *(optional, Round 1 only)*
-- **Avoid** *(optional)*
-    """)
+    <div style="font-size:0.82rem; color:#8b949e; margin-top:0.5rem; line-height:1.6;">
+    Your sheet needs two tabs:<br>
+    <b style="color:#c9d1d9;">Master Players</b> — Name, Level, Default Preference, Default Partner<br>
+    <b style="color:#c9d1d9;">Session</b> — Name, Partner, Preference, Opponent, Avoid<br>
+    Level and defaults are pulled from Master Players automatically.
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Sample CSV download
+with col_csv:
+    st.markdown("**📋 Or Upload a CSV**")
+    st.caption("Need a sample? Download one to get started.")
     sample_data = pd.DataFrame([
-        {"Name": "Alice", "Level": 4.0, "Preference": "Doubles", "Partner": "Bob", "Opponent": "", "Avoid": ""},
-        {"Name": "Bob", "Level": 3.5, "Preference": "Doubles", "Partner": "Alice", "Opponent": "", "Avoid": ""},
-        {"Name": "Carol", "Level": 4.5, "Preference": "Singles", "Partner": "", "Opponent": "Dave", "Avoid": ""},
+        {"Name": "Alice", "Level": 3.5, "Preference": "Doubles", "Partner": "Beth", "Opponent": "", "Avoid": ""},
+        {"Name": "Beth", "Level": 5.0, "Preference": "Doubles", "Partner": "Alice", "Opponent": "", "Avoid": ""},
+        {"Name": "Carl", "Level": 4.0, "Preference": "Singles", "Partner": "", "Opponent": "", "Avoid": ""},
         {"Name": "Dave", "Level": 4.0, "Preference": "Singles", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Eve", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Frank", "Level": 5.0, "Preference": "Doubles", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Grace", "Level": 4.5, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Hank", "Level": 3.5, "Preference": "Doubles", "Partner": "", "Opponent": "", "Avoid": ""},
+        {"Name": "Evan", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
+        {"Name": "Frank", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
+        {"Name": "Grace", "Level": 3.5, "Preference": "Doubles", "Partner": "Heidi", "Opponent": "", "Avoid": ""},
+        {"Name": "Heidi", "Level": 3.5, "Preference": "Doubles", "Partner": "Grace", "Opponent": "", "Avoid": ""},
+        {"Name": "Ivan", "Level": 4.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
+        {"Name": "Jack", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
     ])
     csv_bytes = sample_data.to_csv(index=False).encode()
     st.download_button("📥 Download Sample CSV", data=csv_bytes, file_name="sample_players.csv", mime="text/csv")
+    uploaded_csv = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+
+st.markdown("---")
 
 # ── Data source: Google Sheet takes priority, then CSV upload ──
 df = None
@@ -1090,8 +1193,6 @@ source_label = None
 if st.session_state.sheet_url:
     try:
         df = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Session")
-        # Also fetch Master Players to get accurate levels —
-        # VLOOKUP formulas in Session tab don't evaluate in CSV export
         try:
             df_master = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Master Players")
             level_col_master = find_level_column(df_master)
@@ -1106,8 +1207,6 @@ if st.session_state.sheet_url:
                         master_prefs[n] = clean_str(find_col(row, "Default Preference", "Preference"))
                         master_partners[n] = clean_str(find_col(row, "Default Partner", "Partner"))
 
-                # Ensure Level, Preference, Partner columns exist in session df
-                # (they may have been removed from the sheet)
                 level_col_session = find_level_column(df)
                 if not level_col_session:
                     df["Level"] = ""
@@ -1117,18 +1216,13 @@ if st.session_state.sheet_url:
                 if "Partner" not in df.columns:
                     df["Partner"] = ""
 
-                # Apply master data — always use master level; use master pref/partner
-                # only when session field is blank (allows per-session overrides)
                 for idx, row in df.iterrows():
                     n = clean_str(str(row.get("Name", "")))
                     if n in master_levels:
-                        # Level always comes from master — store as string
                         df.at[idx, level_col_session] = str(master_levels[n])
-                        # Preference: use session value if set, else master default
                         cur_pref = str(df.at[idx, "Preference"]).strip()
                         if cur_pref == "" or cur_pref == "nan":
                             df.at[idx, "Preference"] = master_prefs.get(n, "Either")
-                        # Partner: use session value if set, else master default
                         cur_partner = str(df.at[idx, "Partner"]).strip()
                         if cur_partner == "" or cur_partner == "nan":
                             df.at[idx, "Partner"] = master_partners.get(n, "")
@@ -1142,24 +1236,12 @@ if st.session_state.sheet_url:
     except Exception as e:
         st.markdown(f'<div class="warning-box">❌ Could not load sheet: {e}</div>', unsafe_allow_html=True)
 
-if df is None:
-    uploaded = st.file_uploader("Or upload a CSV file", type=["csv"])
-    if uploaded:
-        try:
-            df = pd.read_csv(uploaded)
-            source_label = "📁 Loaded from CSV upload"
-        except Exception as e:
-            st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
-else:
-    # Still show uploader collapsed so organizer can override if needed
-    with st.expander("Or upload a CSV instead"):
-        uploaded_override = st.file_uploader("Upload CSV (overrides Google Sheet)", type=["csv"])
-        if uploaded_override:
-            try:
-                df = pd.read_csv(uploaded_override)
-                source_label = "📁 Loaded from CSV upload (override)"
-            except Exception as e:
-                st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
+if df is None and uploaded_csv:
+    try:
+        df = pd.read_csv(uploaded_csv)
+        source_label = "📁 Loaded from CSV upload"
+    except Exception as e:
+        st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
 
 if df is not None:
     try:
@@ -1169,7 +1251,14 @@ if df is not None:
             st.markdown('<div class="warning-box">⚠️ No valid players found. Check your CSV or Sheet format.</div>', unsafe_allow_html=True)
             st.stop()
 
-        st.markdown(f'<div class="success-box">{source_label} — {len(players)} players found.</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="success-box" id="players-loaded">{source_label} — {len(players)} players found.</div>', unsafe_allow_html=True)
+
+        # Auto-scroll to players section
+        st.components.v1.html(
+            '<script>window.parent.document.getElementById("players-loaded")'
+            '?.scrollIntoView({behavior:"smooth",block:"start"});</script>',
+            height=0,
+        )
 
         # Stats bar
         n_singles = sum(1 for p in players if p["pref"] == "Singles")
@@ -1297,6 +1386,6 @@ else:
     <div style="text-align:center; padding: 3rem; color: #8b949e;">
         <div style="font-size: 3rem; margin-bottom: 1rem;">🎾</div>
         <div style="font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: 2px; color: #4ade80;">Ready when you are</div>
-        <div style="font-size: 0.9rem; margin-top: 0.5rem; color: #c9d1d9;">Paste a Google Sheet URL in the sidebar, or upload a CSV file below.</div>
+        <div style="font-size: 0.9rem; margin-top: 0.5rem; color: #c9d1d9;">Paste a Google Sheet URL or upload a CSV above to get started.</div>
     </div>
     """, unsafe_allow_html=True)
