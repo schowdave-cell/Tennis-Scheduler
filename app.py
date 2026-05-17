@@ -381,14 +381,61 @@ input[type="number"], input[type="text"], input {
 }
 
 
-    background: #161b22;
-    border-radius: 10px;
-    overflow: hidden;
-    border: 1px solid #30363d;
-}
-
 .stDataFrame {
     background: #161b22 !important;
+}
+
+/* ── Selectbox / dropdown fixes ── */
+[data-testid="stSelectbox"] > div > div {
+    background-color: #21262d !important;
+    border: 1px solid #4ade8055 !important;
+    border-radius: 6px !important;
+}
+
+/* Force all text inside selectbox to be clearly visible white */
+[data-testid="stSelectbox"] *,
+[data-testid="stSelectbox"] div,
+[data-testid="stSelectbox"] span,
+[data-testid="stSelectbox"] p,
+[data-testid="stSelectbox"] input {
+    color: #e6edf3 !important;
+}
+
+/* Dropdown popup menu */
+[data-baseweb="popover"],
+[data-baseweb="popover"] *,
+[data-baseweb="menu"],
+[data-baseweb="menu"] * {
+    background-color: #1c2330 !important;
+    color: #e6edf3 !important;
+}
+
+[data-baseweb="popover"] {
+    border: 1px solid #30363d !important;
+}
+
+[data-baseweb="option"] {
+    background-color: #1c2330 !important;
+    color: #e6edf3 !important;
+}
+
+[data-baseweb="option"]:hover,
+[data-baseweb="option"][aria-selected="true"] {
+    background-color: #2d4a3e !important;
+    color: #4ade80 !important;
+}
+
+/* Load button alignment fix */
+.stButton > button,
+.stButton > button > div,
+.stButton > button p {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    margin: 0 !important;
+    line-height: 1 !important;
+    width: 100% !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -723,10 +770,40 @@ def make_doubles_matches(pool, fixed_partners, rng=None, r1_rng=None, avoid_matc
     leftover = [p for team in leftover_teams for p in team] + leftover_players
     return matches, leftover
 
-def make_singles_matches(pool):
-    """Form singles matches from pool. Returns matches and leftover."""
+def make_singles_matches(pool, avoid_keys=None):
+    """Form singles matches from pool. Returns matches and leftover.
+    avoid_keys: set of frozensets of player name pairs to avoid repeating.
+    """
+    avoid_keys = avoid_keys or set()
     sorted_pool = sorted(pool, key=lambda x: x["level"])
     matches = []
+    remaining = list(sorted_pool)
+
+    # If we have avoid constraints, try to shuffle to dodge repeats
+    if avoid_keys and len(remaining) >= 2:
+        # Try adjacent pairings first, then swap neighbors to break repeats
+        used = [False] * len(remaining)
+        result = []
+        for i in range(len(remaining)):
+            if used[i]:
+                continue
+            # Try pairing with next unused, skip if repeat and a better option exists
+            for j in range(i + 1, len(remaining)):
+                if used[j]:
+                    continue
+                pair_key = frozenset([remaining[i]["name"], remaining[j]["name"]])
+                is_repeat = pair_key in avoid_keys
+                # Accept non-repeat immediately, or accept repeat if no other choice
+                next_unused = [k for k in range(i + 1, len(remaining)) if not used[k] and k != j]
+                if not is_repeat or not next_unused:
+                    result.append((remaining[i], remaining[j]))
+                    used[i] = True
+                    used[j] = True
+                    break
+        leftover = [remaining[i] for i in range(len(remaining)) if not used[i]]
+        return result, leftover
+
+    # No avoid constraints — simple sequential pairing
     i = 0
     while i + 1 < len(sorted_pool):
         matches.append((sorted_pool[i], sorted_pool[i+1]))
@@ -840,56 +917,142 @@ def assign_round1(players, rng=None, max_courts=None):
     return singles_matches, doubles_matches, on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys
 
 
-def either_singles_rotation(singles_players, either_players, r1_singles_keys, rng=None):
+def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_threshold, max_courts, current_doubles_courts, non_singles_count=None, rng=None):
     """
-    If Round 1 singles matchup would repeat, pull 4 Either players in to create
-    3 new singles matches. Uses rng to shuffle among equal-level candidates so
-    the selection rotates on each click.
+    Decide how to handle singles in Round 2 to avoid R1 repeat matchups.
+
+    Rules:
+    - If all R1 singles pairings can be swapped within the singles group
+      such that every new pairing is within balance_threshold, do the swap.
+    - If no valid swap exists among the singles group (levels too spread),
+      keep the same R1 pairings (repeat is unavoidable).
+    - If there are exactly 2 singles players (swap impossible), pull Either
+      players out of doubles to give each singles player a new opponent.
+      Pull 2 if the remaining doubles pool is divisible by 4, otherwise pull 4.
+      Only do this if enough courts are available. Otherwise keep same pairing.
+
+    Returns: list of (p1, p2) singles matches, list of Either players pulled out
     """
-    if len(singles_players) != 2:
-        return [], [], False
-    p1, p2 = singles_players
-    would_repeat = frozenset([p1["name"], p2["name"]]) in r1_singles_keys
-    if not would_repeat:
-        return [], [], False
-    if len(either_players) < 4:
-        return [], [], False
+    n = len(singles_players)
+    if n == 0:
+        return [], []
 
-    available = list(either_players)
-    # Shuffle first so equal-level players rotate each click
-    if rng:
-        rng.shuffle(available)
+    # --- 4+ singles players: try to swap within the group ---
+    if n >= 4:
+        # Build R1 pairs
+        r1_pairs = []
+        used = set()
+        for i, p1 in enumerate(singles_players):
+            if p1["name"] in used:
+                continue
+            for p2 in singles_players[i+1:]:
+                if p2["name"] in used:
+                    continue
+                if frozenset([p1["name"], p2["name"]]) in r1_singles_keys:
+                    r1_pairs.append((p1, p2))
+                    used.add(p1["name"])
+                    used.add(p2["name"])
+                    break
 
-    available.sort(key=lambda e: abs(e["level"] - p1["level"]))
-    either_a = available.pop(0)
+        # Try to find a rotation of pairs where all gaps <= threshold
+        # Simple approach: try all permutations of the "right-hand" players
+        left = [pair[0] for pair in r1_pairs]
+        right = [pair[1] for pair in r1_pairs]
 
-    available.sort(key=lambda e: abs(e["level"] - p2["level"]))
-    either_b = available.pop(0)
+        from itertools import permutations
+        best_swap = None
+        for perm in permutations(right):
+            # No pair can be the same as R1
+            if any(frozenset([left[i]["name"], perm[i]["name"]]) in r1_singles_keys
+                   for i in range(len(left))):
+                continue
+            # All gaps must be within threshold
+            if all(abs(left[i]["level"] - perm[i]["level"]) <= balance_threshold
+                   for i in range(len(left))):
+                best_swap = list(zip(left, perm))
+                break
 
-    best_pair = None
-    best_gap = float("inf")
-    for i in range(len(available)):
-        for j in range(i+1, len(available)):
-            gap = abs(available[i]["level"] - available[j]["level"])
-            if gap < best_gap:
-                best_gap = gap
-                best_pair = (available[i], available[j])
+        if best_swap:
+            return best_swap, []
+        else:
+            # No valid swap — repeat the same pairings
+            return list(r1_singles_keys and [(p1, p2) for p1, p2 in
+                        [(s, next((q for q in singles_players if frozenset([s["name"], q["name"]]) in r1_singles_keys), None))
+                         for s in left] if p2] or r1_pairs), []
 
-    if best_pair is None:
-        return [], [], False
+    # --- Exactly 2 singles players ---
+    if n == 2:
+        p1, p2 = singles_players
+        would_repeat = frozenset([p1["name"], p2["name"]]) in r1_singles_keys
 
-    either_c, either_d = best_pair
-    new_singles = [(p1, either_a), (p2, either_b), (either_c, either_d)]
-    used_either = [either_a, either_b, either_c, either_d]
-    return new_singles, used_either, True
+        if not would_repeat:
+            return [(p1, p2)], []
+
+        # non_singles_count is the number of non-singles players (the raw doubles pool).
+        # After pulling 2 Either players into singles, the remaining doubles pool is
+        # non_singles_count - 2. If that's divisible by 4, pull 2. Otherwise pull 4.
+        pool_size = non_singles_count if non_singles_count is not None else current_doubles_courts * 4
+        rem2 = (pool_size - 2) % 4
+        rem4 = (pool_size - 4) % 4
+        # Pick whichever pull leaves fewer players on deck (smaller remainder)
+        # Prefer pull-2 on a tie since it keeps more players in doubles
+        need_pull = 2 if rem2 <= rem4 else 4
+
+        enough_courts = (max_courts is None) or (current_doubles_courts >= 2)
+        if len(either_pool) < need_pull or not enough_courts:
+            return [(p1, p2)], []
+
+        available = list(either_pool)
+        if rng:
+            rng.shuffle(available)
+
+        # Always pick the closest-level Either player for p1, then for p2
+        available.sort(key=lambda e: abs(e["level"] - p1["level"]))
+        either_a = available.pop(0)
+
+        available.sort(key=lambda e: abs(e["level"] - p2["level"]))
+        either_b = available.pop(0)
+
+        new_singles = [(p1, either_a), (p2, either_b)]
+        pulled = [either_a, either_b]
+
+        # If we need 4, pull the closest-level pair from what remains
+        if need_pull == 4:
+            if len(available) < 2:
+                return [(p1, p2)], []
+            best_pair = None
+            best_gap = float("inf")
+            for i in range(len(available)):
+                for j in range(i + 1, len(available)):
+                    gap = abs(available[i]["level"] - available[j]["level"])
+                    if gap < best_gap:
+                        best_gap = gap
+                        best_pair = (available[i], available[j])
+            if best_pair is None:
+                return [(p1, p2)], []
+            either_c, either_d = best_pair
+            new_singles.append((either_c, either_d))
+            pulled.extend([either_c, either_d])
+
+        return new_singles, pulled
+
+    # --- Odd number (1 or 3): just match what we can, leftover handled by caller ---
+    sorted_s = sorted(singles_players, key=lambda x: x["level"])
+    matches = []
+    for i in range(0, len(sorted_s) - 1, 2):
+        matches.append((sorted_s[i], sorted_s[i+1]))
+    return matches, []
 
 
 def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
-                  r1_singles_keys=None, max_courts=None):
+                  r1_singles_keys=None, max_courts=None, balance_threshold=0.5):
     """
-    Round 2: reshuffle, no fixed opponent constraint.
-    Respects court limit. Forces all-doubles if court-constrained.
-    If singles matchup would repeat, pulls 4 Either players in for 3 singles matches.
+    Round 2: reshuffle avoiding R1 repeat matchups.
+    Singles repeat-avoidance:
+      - 4+ singles players: try to swap within the group (within balance_threshold).
+        If no valid swap, repeat same pairings.
+      - 2 singles players: pull 4 Either players out of doubles to make 3 singles courts,
+        but only if enough courts are available. Otherwise repeat same pairing.
     """
     n = len(players)
     force_all_doubles = False
@@ -922,26 +1085,30 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
         either_pool = [p for p in active_players
                        if p["pref"] in ("Either", "Doubles") and not p["partner"]]
 
-        new_singles, used_either, rotated = either_singles_rotation(
-            singles_pool, either_pool, r1_singles_keys or set(), rng=rng
+        # How many non-singles players exist (the doubles pool before any pulling)
+        non_singles = [p for p in active_players if p["pref"] != "Singles"]
+        current_doubles_courts = len(non_singles) // 4
+        non_singles_count = len(non_singles)
+
+        r2_singles, pulled_either = plan_r2_singles(
+            singles_pool, either_pool, r1_singles_keys or set(),
+            balance_threshold, max_courts, current_doubles_courts, non_singles_count, rng=rng
         )
 
-        if rotated:
-            singles_matches.extend(new_singles)
-            for m in new_singles:
-                used.add(m[0]["name"])
-                used.add(m[1]["name"])
-            doubles_pool = [p for p in active_players if p["name"] not in used]
-            s_leftover = []
-        else:
-            singles_pool.sort(key=lambda x: x["level"])
-            s_matches, s_leftover = make_singles_matches(singles_pool)
-            singles_matches.extend(s_matches)
-            for m in s_matches:
-                used.add(m[0]["name"])
-                used.add(m[1]["name"])
-            doubles_pool = [p for p in active_players
-                            if p["name"] not in used and p not in s_leftover]
+        singles_matches.extend(r2_singles)
+        for m in r2_singles:
+            used.add(m[0]["name"])
+            used.add(m[1]["name"])
+
+        # Singles leftovers (odd singles player)
+        s_leftover = [p for p in singles_pool if p["name"] not in used]
+
+        # Remaining doubles pool excludes singles players and pulled Either players
+        pulled_names = {p["name"] for p in pulled_either}
+        doubles_pool = [p for p in active_players
+                        if p["name"] not in used
+                        and p["name"] not in pulled_names
+                        and p not in s_leftover]
 
         d_matches, d_leftover = make_doubles_matches(
             doubles_pool, {}, rng=rng,
@@ -957,7 +1124,7 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
         all_leftover = s_leftover + d_leftover
         if all_leftover:
             rng.shuffle(all_leftover)
-            extra_s, extra_bye = make_singles_matches(all_leftover)
+            extra_s, extra_bye = make_singles_matches(all_leftover, avoid_keys=r1_singles_keys or set())
             singles_matches.extend(extra_s)
             for m in extra_s:
                 used.add(m[0]["name"])
@@ -1050,6 +1217,32 @@ def sheets_url_to_csv(url, sheet_name="Session"):
         f"https://docs.google.com/spreadsheets/d/{sheet_id}"
         f"/gviz/tq?tqx=out:csv&sheet={requests.utils.quote(sheet_name)}"
     )
+
+@st.cache_data(show_spinner=False)
+def load_master_players_cached(url):
+    """Fetch and parse Master Players from Google Sheet. Cached by URL so reruns don't re-fetch."""
+    df = fetch_sheet_as_df(url, sheet_name="Master Players")
+    level_col = find_level_column(df)
+    players = []
+    if level_col and "Name" in df.columns:
+        for _, row in df.iterrows():
+            n = clean_str(str(row.get("Name", "")))
+            if not n or len(n) > 50 or any(ord(c) > 127 for c in n):
+                continue
+            active = clean_str(find_col(row, "Active?", "Active")).lower()
+            if active == "no":
+                continue
+            players.append({
+                "name": n,
+                "level": parse_level(str(row[level_col])),
+                "pref": clean_str(find_col(row, "Default Preference", "Preference")).capitalize() or "Either",
+                "partner": clean_str(find_col(row, "Default Partner", "Partner")),
+                "opponent": "",
+                "avoid": "",
+            })
+    players.sort(key=lambda p: p["name"].lower())
+    return players
+
 
 def fetch_sheet_as_df(url, sheet_name="Session"):
     """Fetch a Google Sheet tab as a DataFrame. Raises on any error."""
@@ -1158,10 +1351,9 @@ with col_url:
 
     st.markdown("""
     <div style="font-size:0.82rem; color:#8b949e; margin-top:0.5rem; line-height:1.6;">
-    Your sheet needs two tabs:<br>
+    Your sheet needs one tab:<br>
     <b style="color:#c9d1d9;">Master Players</b> — Name, Level, Default Preference, Default Partner<br>
-    <b style="color:#c9d1d9;">Session</b> — Name, Partner, Preference, Opponent, Avoid<br>
-    Level and defaults are pulled from Master Players automatically.
+    Player attendance and per-session overrides are managed in the app below.
     </div>
     """, unsafe_allow_html=True)
 
@@ -1186,81 +1378,226 @@ with col_csv:
 
 st.markdown("---")
 
-# ── Data source: Google Sheet takes priority, then CSV upload ──
-df = None
+# ── Load master players ──
+master_players = []
 source_label = None
 
 if st.session_state.sheet_url:
     try:
-        df = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Session")
-        try:
-            df_master = fetch_sheet_as_df(st.session_state.sheet_url, sheet_name="Master Players")
-            level_col_master = find_level_column(df_master)
-            if level_col_master and "Name" in df_master.columns:
-                master_levels = {}
-                master_prefs = {}
-                master_partners = {}
-                for _, row in df_master.iterrows():
-                    n = clean_str(str(row.get("Name", "")))
-                    if n:
-                        master_levels[n] = parse_level(str(row[level_col_master]))
-                        master_prefs[n] = clean_str(find_col(row, "Default Preference", "Preference"))
-                        master_partners[n] = clean_str(find_col(row, "Default Partner", "Partner"))
-
-                level_col_session = find_level_column(df)
-                if not level_col_session:
-                    df["Level"] = ""
-                    level_col_session = "Level"
-                if "Preference" not in df.columns:
-                    df["Preference"] = ""
-                if "Partner" not in df.columns:
-                    df["Partner"] = ""
-
-                for idx, row in df.iterrows():
-                    n = clean_str(str(row.get("Name", "")))
-                    if n in master_levels:
-                        df.at[idx, level_col_session] = str(master_levels[n])
-                        cur_pref = str(df.at[idx, "Preference"]).strip()
-                        if cur_pref == "" or cur_pref == "nan":
-                            df.at[idx, "Preference"] = master_prefs.get(n, "Either")
-                        cur_partner = str(df.at[idx, "Partner"]).strip()
-                        if cur_partner == "" or cur_partner == "nan":
-                            df.at[idx, "Partner"] = master_partners.get(n, "")
-        except Exception as master_err:
-            st.markdown(f'<div class="warning-box">⚠️ Could not load Master Players tab: {master_err} — levels will default to 3.5</div>', unsafe_allow_html=True)
-        source_label = "📊 Loaded from Google Sheet"
-    except PermissionError as e:
-        st.markdown(f'<div class="warning-box">🔒 {e}</div>', unsafe_allow_html=True)
-    except ValueError as e:
-        st.markdown(f'<div class="warning-box">⚠️ {e}</div>', unsafe_allow_html=True)
+        master_players = load_master_players_cached(st.session_state.sheet_url)
+        source_label = f"📊 {len(master_players)} players loaded from Google Sheet"
     except Exception as e:
-        st.markdown(f'<div class="warning-box">❌ Could not load sheet: {e}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="warning-box">❌ Could not load Master Players tab: {e}</div>', unsafe_allow_html=True)
 
-if df is None and uploaded_csv:
+elif uploaded_csv:
     try:
-        df = pd.read_csv(uploaded_csv)
-        source_label = "📁 Loaded from CSV upload"
+        df_csv = pd.read_csv(uploaded_csv)
+        master_players = load_players(df_csv)
+        master_players.sort(key=lambda p: p["name"].lower())
+        source_label = f"📁 {len(master_players)} players loaded from CSV"
     except Exception as e:
         st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
 
-if df is not None:
-    try:
-        players = load_players(df)
+# ── Session manager ──
+if master_players:
+    st.markdown(f'<div class="success-box" id="players-loaded">{source_label}</div>', unsafe_allow_html=True)
+    st.components.v1.html(
+        '<script>window.parent.document.getElementById("players-loaded")'
+        '?.scrollIntoView({behavior:"smooth",block:"start"});</script>',
+        height=0,
+    )
 
-        if not players:
-            st.markdown('<div class="warning-box">⚠️ No valid players found. Check your CSV or Sheet format.</div>', unsafe_allow_html=True)
-            st.stop()
+    # Init session state
+    if "overrides" not in st.session_state:
+        st.session_state.overrides = {}
+    if "guests" not in st.session_state:
+        st.session_state.guests = []
+    # Ensure a widget-key entry exists for every player (default unchecked)
+    for _p in master_players:
+        if f"chk_{_p['name']}" not in st.session_state:
+            st.session_state[f"chk_{_p['name']}"] = False
 
-        st.markdown(f'<div class="success-box" id="players-loaded">{source_label} — {len(players)} players found.</div>', unsafe_allow_html=True)
+    st.markdown("### 👥 Who's Playing Today?")
 
-        # Auto-scroll to players section
-        st.components.v1.html(
-            '<script>window.parent.document.getElementById("players-loaded")'
-            '?.scrollIntoView({behavior:"smooth",block:"start"});</script>',
-            height=0,
-        )
+    ctrl1, ctrl2 = st.columns([2, 2])
+    with ctrl1:
+        if st.button("☑️ Select All"):
+            for _p in master_players:
+                st.session_state[f"chk_{_p['name']}"] = True
+            st.rerun()
+    with ctrl2:
+        if st.button("🗑️ Clear All"):
+            for _p in master_players:
+                st.session_state[f"chk_{_p['name']}"] = False
+            st.session_state.overrides = {}
+            st.session_state.guests = []
+            st.rerun()
 
-        # Stats bar
+    st.markdown("")
+
+    all_names = [p["name"] for p in master_players]
+
+    # Table header
+    h0, h1, h2, h3, h4, h5 = st.columns([0.5, 2, 1, 1.5, 1.5, 1.5])
+    h0.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>IN</div>", unsafe_allow_html=True)
+    h1.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>NAME</div>", unsafe_allow_html=True)
+    h2.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>LEVEL</div>", unsafe_allow_html=True)
+    h3.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>PREFERENCE</div>", unsafe_allow_html=True)
+    h4.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>PARTNER</div>", unsafe_allow_html=True)
+    h5.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>OPPONENT (R1)</div>", unsafe_allow_html=True)
+    st.markdown("<hr style='margin:4px 0 8px 0;border-color:#30363d;'>", unsafe_allow_html=True)
+
+    for p in master_players:
+        c0, c1, c2, c3, c4, c5 = st.columns([0.5, 2, 1, 1.5, 1.5, 1.5])
+
+        # Seed override dict from player defaults the first time we see this player
+        if p["name"] not in st.session_state.overrides:
+            st.session_state.overrides[p["name"]] = {
+                "pref": p["pref"] if p["pref"] else "",
+                "partner": p["partner"] if p["partner"] else "",
+                "opponent": "",
+            }
+        ov = st.session_state.overrides[p["name"]]
+
+        with c0:
+            st.checkbox("", key=f"chk_{p['name']}", label_visibility="collapsed")
+
+        with c1:
+            st.markdown(f"<div style='padding-top:0.4rem;color:#e6edf3;font-weight:500;'>{p['name']}</div>", unsafe_allow_html=True)
+
+        with c2:
+            st.markdown(f"<div style='padding-top:0.4rem;color:#c9d1d9;'>{p['level']}</div>", unsafe_allow_html=True)
+
+        with c3:
+            pref_opts = ["", "Singles", "Doubles", "Either"]
+            cur_pref = ov.get("pref", "") or ""
+            new_pref = st.selectbox("", pref_opts,
+                index=pref_opts.index(cur_pref) if cur_pref in pref_opts else 0,
+                key=f"pref_{p['name']}", label_visibility="collapsed",
+            )
+            ov["pref"] = new_pref
+
+        with c4:
+            partner_opts = [""] + [n for n in all_names if n != p["name"]]
+            cur_partner = ov.get("partner", p["partner"]) or p["partner"]
+            partner_idx = partner_opts.index(cur_partner) if cur_partner in partner_opts else 0
+            new_partner = st.selectbox("", partner_opts,
+                index=partner_idx,
+                key=f"partner_{p['name']}", label_visibility="collapsed",
+            )
+            ov["partner"] = new_partner
+
+        with c5:
+            opp_opts = [""] + [n for n in all_names if n != p["name"]]
+            cur_opp = ov.get("opponent", "") or ""
+            opp_idx = opp_opts.index(cur_opp) if cur_opp in opp_opts else 0
+            new_opp = st.selectbox("", opp_opts,
+                index=opp_idx,
+                key=f"opp_{p['name']}", label_visibility="collapsed",
+            )
+            ov["opponent"] = new_opp
+
+        st.session_state.overrides[p["name"]] = ov
+
+    # Guest players
+    st.markdown("---")
+    st.markdown("### ➕ Add Guest Player")
+
+    # All names available for partner/opponent selection (master + already-added guests)
+    all_checked_names = [p["name"] for p in master_players if st.session_state.get(f"chk_{p['name']}", False)]
+    guest_name_opts = [""] + all_checked_names + [g["name"] for g in st.session_state.guests]
+
+    g1, g2, g3, g4 = st.columns([2.5, 1.8, 1.8, 1.2])
+    with g1:
+        st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>NAME</div>", unsafe_allow_html=True)
+        guest_name = st.text_input("Name", key="guest_name", placeholder="First Last", label_visibility="collapsed")
+    with g2:
+        st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>LEVEL</div>", unsafe_allow_html=True)
+        guest_level = st.number_input("Level", min_value=1.0, max_value=7.0, value=3.5, step=0.5, key="guest_level", label_visibility="collapsed", format="%.1f")
+    with g3:
+        st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>PREFERENCE</div>", unsafe_allow_html=True)
+        guest_pref = st.selectbox("Preference", ["Either", "Singles", "Doubles"], key="guest_pref", label_visibility="collapsed")
+    with g4:
+        st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>&nbsp;</div>", unsafe_allow_html=True)
+        if st.button("Add Guest", use_container_width=True):
+            name = guest_name.strip()
+            if name:
+                st.session_state.guests.append({
+                    "name": name,
+                    "level": float(guest_level),
+                    "pref": guest_pref,
+                    "partner": "",
+                    "opponent": "",
+                    "avoid": "",
+                })
+                st.rerun()
+
+    if st.session_state.guests:
+        st.markdown("<div style='font-size:0.78rem;color:#8b949e;margin:8px 0 4px 0;'>Set partner or opponent after adding both players:</div>", unsafe_allow_html=True)
+
+        # Header
+        gh0, gh1, gh2, gh3, gh4, gh5 = st.columns([2.0, 1.2, 1.5, 2.0, 2.0, 0.8])
+        gh0.markdown("<div style='font-size:0.75rem;color:#4ade80;font-weight:600;'>GUEST</div>", unsafe_allow_html=True)
+        gh1.markdown("<div style='font-size:0.75rem;color:#4ade80;font-weight:600;'>LEVEL</div>", unsafe_allow_html=True)
+        gh2.markdown("<div style='font-size:0.75rem;color:#4ade80;font-weight:600;'>PREF</div>", unsafe_allow_html=True)
+        gh3.markdown("<div style='font-size:0.75rem;color:#4ade80;font-weight:600;'>PARTNER</div>", unsafe_allow_html=True)
+        gh4.markdown("<div style='font-size:0.75rem;color:#4ade80;font-weight:600;'>OPPONENT (R1)</div>", unsafe_allow_html=True)
+
+        for i, g in enumerate(st.session_state.guests):
+            # Options exclude the guest themselves
+            opts = [""] + all_checked_names + [gg["name"] for gg in st.session_state.guests if gg["name"] != g["name"]]
+            gc0, gc1, gc2, gc3, gc4, gc5 = st.columns([2.0, 1.2, 1.5, 2.0, 2.0, 0.8])
+            with gc0:
+                st.markdown(f"<div style='padding-top:0.4rem;color:#e6edf3;font-weight:500;'>{g['name']}</div>", unsafe_allow_html=True)
+            with gc1:
+                st.markdown(f"<div style='padding-top:0.4rem;color:#c9d1d9;'>{g['level']}</div>", unsafe_allow_html=True)
+            with gc2:
+                st.markdown(f"<div style='padding-top:0.4rem;color:#c9d1d9;'>{g['pref']}</div>", unsafe_allow_html=True)
+            with gc3:
+                cur_partner = g.get("partner", "")
+                partner_idx = opts.index(cur_partner) if cur_partner in opts else 0
+                new_partner = st.selectbox("", opts, index=partner_idx,
+                    key=f"gpartner_{i}", label_visibility="collapsed")
+                if new_partner != cur_partner:
+                    g["partner"] = new_partner
+                    # Set reverse link on the selected guest if they have no partner yet
+                    for other in st.session_state.guests:
+                        if other["name"] == new_partner and not other.get("partner"):
+                            other["partner"] = g["name"]
+                    st.rerun()
+            with gc4:
+                cur_opp = g.get("opponent", "")
+                opp_idx = opts.index(cur_opp) if cur_opp in opts else 0
+                new_opp = st.selectbox("", opts, index=opp_idx,
+                    key=f"gopp_{i}", label_visibility="collapsed")
+                if new_opp != cur_opp:
+                    g["opponent"] = new_opp
+                    st.rerun()
+            with gc5:
+                if st.button("✕", key=f"remove_guest_{i}"):
+                    st.session_state.guests.pop(i)
+                    st.rerun()
+
+    # Build final player list
+    players = []
+    for p in master_players:
+        if st.session_state.get(f"chk_{p['name']}", False):
+            ov = st.session_state.overrides.get(p["name"], {})
+            players.append({
+                "name": p["name"],
+                "level": p["level"],
+                "pref": ov.get("pref") or p["pref"],
+                "partner": ov.get("partner") or p["partner"],
+                "opponent": ov.get("opponent") or p["opponent"],
+                "avoid": p["avoid"],
+            })
+    players.extend(st.session_state.guests)
+
+    st.markdown("---")
+
+    if not players:
+        st.markdown('<div class="warning-box">⚠️ No players selected — check at least one player above.</div>', unsafe_allow_html=True)
+    else:
         n_singles = sum(1 for p in players if p["pref"] == "Singles")
         n_doubles = sum(1 for p in players if p["pref"] == "Doubles")
         n_either = sum(1 for p in players if p["pref"] == "Either")
@@ -1269,7 +1606,7 @@ if df is not None:
 
         st.markdown(f"""
         <div>
-            <span class="stat-pill">Players: <span>{len(players)}</span></span>
+            <span class="stat-pill">Playing today: <span>{len(players)}</span></span>
             <span class="stat-pill">Singles-only: <span>{n_singles}</span></span>
             <span class="stat-pill">Doubles-only: <span>{n_doubles}</span></span>
             <span class="stat-pill">Either: <span>{n_either}</span></span>
@@ -1278,34 +1615,25 @@ if df is not None:
         </div>
         """, unsafe_allow_html=True)
 
-        with st.expander("👥 View Player Roster"):
-            display_df = pd.DataFrame(players)[["name","level","pref","partner","opponent"]]
-            display_df.columns = ["Name","Level","Preference","Fixed Partner","Fixed Opponent"]
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-
+        st.markdown("")
         col_btn, col_info = st.columns([2, 3])
         with col_btn:
             generate = st.button("🎾 Generate Matchups")
         with col_info:
             if st.session_state.seed > 42:
-                st.caption(f"Click again to try a different arrangement. (seed {st.session_state.seed})")
+                st.caption(f"Click again for a different arrangement. (seed {st.session_state.seed})")
 
         if generate:
             seed = st.session_state.seed
             st.session_state.seed += 1
             rng = random.Random(seed)
 
-            # Round 1 — optimal matching; rng used only for tie-breaking
             r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys = assign_round1(players, rng=rng, max_courts=max_courts)
             r1_courts, _ = render_schedule(r1_singles, r1_doubles, [], 1, balance_threshold)
 
-            # Round 2 — reshuffled, avoids repeating R1 opponents and partners where possible
-            r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts)
+            r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts, balance_threshold=balance_threshold)
             r2_courts, _ = render_schedule(r2_singles, r2_doubles, [], 2, balance_threshold)
 
-            # Verify all players appear (on court or on deck)
             r1_names = set()
             for c in r1_courts:
                 for nm in c["display"].replace(" vs ", " & ").split(" & "):
@@ -1318,17 +1646,16 @@ if df is not None:
                     r2_names.add(nm.strip())
             r2_names.update(p["name"] for p in r2_on_deck)
 
-            all_names = set(p["name"] for p in players)
-            r1_missing = all_names - r1_names
-            r2_missing = all_names - r2_names
+            all_names_set = set(p["name"] for p in players)
+            r1_missing = all_names_set - r1_names
+            r2_missing = all_names_set - r2_names
 
             if r1_missing or r2_missing:
-                st.markdown(f'<div class="warning-box">⚠️ Player integrity check failed. Missing in R1: {r1_missing}. Missing in R2: {r2_missing}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="warning-box">⚠️ Integrity check failed. Missing in R1: {r1_missing}. Missing in R2: {r2_missing}</div>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<div class="success-box">✅ All {len(players)} players accounted for in both rounds.</div>', unsafe_allow_html=True)
 
             col1, col2 = st.columns(2)
-
             with col1:
                 st.markdown('<div class="round-header">Round 1</div>', unsafe_allow_html=True)
                 for c in r1_courts:
@@ -1368,8 +1695,6 @@ if df is not None:
                     st.markdown(f'<div class="bye-card">⏸ On Deck: {", ".join(p["name"] for p in r2_on_deck)}</div>', unsafe_allow_html=True)
 
             st.markdown("---")
-
-            # Export
             export_str = export_text(r1_courts, r1_on_deck, r2_courts, r2_on_deck)
             st.download_button(
                 "📄 Export Schedule as .txt",
@@ -1377,15 +1702,3 @@ if df is not None:
                 file_name="tennis_schedule.txt",
                 mime="text/plain",
             )
-
-    except Exception as e:
-        st.markdown(f'<div class="warning-box">❌ Error processing player data: {e}</div>', unsafe_allow_html=True)
-
-else:
-    st.markdown("""
-    <div style="text-align:center; padding: 3rem; color: #8b949e;">
-        <div style="font-size: 3rem; margin-bottom: 1rem;">🎾</div>
-        <div style="font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: 2px; color: #4ade80;">Ready when you are</div>
-        <div style="font-size: 0.9rem; margin-top: 0.5rem; color: #c9d1d9;">Paste a Google Sheet URL or upload a CSV above to get started.</div>
-    </div>
-    """, unsafe_allow_html=True)
