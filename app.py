@@ -865,7 +865,7 @@ def assign_round1(players, rng=None, max_courts=None):
                 used.add(p["name"])
                 used.add(opp["name"])
 
-        singles_pool = [p for p in active_players if p["pref"] == "Singles" and p["name"] not in used]
+        singles_pool = [p for p in active_players if p["pref"] == "Singles" and p["name"] not in used and not p["partner"]]
         s_matches, s_leftover = make_singles_matches(singles_pool)
         singles_matches.extend(s_matches)
         for m in s_matches:
@@ -884,12 +884,15 @@ def assign_round1(players, rng=None, max_courts=None):
         # Combine all leftovers and try singles before on_deck
         all_leftover = s_leftover + d_leftover
         if all_leftover:
-            extra_s, extra_bye = make_singles_matches(all_leftover)
+            # Players with a fixed partner must never play singles — send them on deck
+            singles_eligible = [p for p in all_leftover if not p["partner"]]
+            forced_deck = [p for p in all_leftover if p["partner"]]
+            extra_s, extra_bye = make_singles_matches(singles_eligible)
             singles_matches.extend(extra_s)
             for m in extra_s:
                 used.add(m[0]["name"])
                 used.add(m[1]["name"])
-            on_deck.extend(extra_bye)
+            on_deck.extend(extra_bye + forced_deck)
     else:
         # Court-constrained: all doubles, no singles
         d_matches, d_leftover = make_doubles_matches(active_players, {}, rng=None, r1_rng=rng)
@@ -1081,12 +1084,13 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
     doubles_matches = []
 
     if not force_all_doubles:
-        singles_pool = [p for p in active_players if p["pref"] == "Singles"]
+        singles_pool = [p for p in active_players if p["pref"] == "Singles" and not p["partner"]]
         either_pool = [p for p in active_players
                        if p["pref"] in ("Either", "Doubles") and not p["partner"]]
 
         # How many non-singles players exist (the doubles pool before any pulling)
-        non_singles = [p for p in active_players if p["pref"] != "Singles"]
+        # Players with a fixed partner always play doubles even if pref=Singles
+        non_singles = [p for p in active_players if p["pref"] != "Singles" or p["partner"]]
         current_doubles_courts = len(non_singles) // 4
         non_singles_count = len(non_singles)
 
@@ -1124,12 +1128,14 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
         all_leftover = s_leftover + d_leftover
         if all_leftover:
             rng.shuffle(all_leftover)
-            extra_s, extra_bye = make_singles_matches(all_leftover, avoid_keys=r1_singles_keys or set())
+            singles_eligible = [p for p in all_leftover if not p["partner"]]
+            forced_deck = [p for p in all_leftover if p["partner"]]
+            extra_s, extra_bye = make_singles_matches(singles_eligible, avoid_keys=r1_singles_keys or set())
             singles_matches.extend(extra_s)
             for m in extra_s:
                 used.add(m[0]["name"])
                 used.add(m[1]["name"])
-            on_deck.extend(extra_bye)
+            on_deck.extend(extra_bye + forced_deck)
     else:
         d_matches, d_leftover = make_doubles_matches(
             active_players, {}, rng=rng,
@@ -1318,6 +1324,8 @@ with st.sidebar:
         st.session_state.seed = 42
     if "sheet_url" not in st.session_state:
         st.session_state.sheet_url = ""
+    if "schedule" not in st.session_state:
+        st.session_state.schedule = None
 
     max_courts = st.number_input("🎾 Number of courts available", min_value=1, max_value=20, value=10,
         help="Maximum courts in use per round. If players exceed court capacity, all matches become doubles and overflow players are shown as On Deck.")
@@ -1401,11 +1409,6 @@ elif uploaded_csv:
 # ── Session manager ──
 if master_players:
     st.markdown(f'<div class="success-box" id="players-loaded">{source_label}</div>', unsafe_allow_html=True)
-    st.components.v1.html(
-        '<script>window.parent.document.getElementById("players-loaded")'
-        '?.scrollIntoView({behavior:"smooth",block:"start"});</script>',
-        height=0,
-    )
 
     # Init session state
     if "overrides" not in st.session_state:
@@ -1435,7 +1438,11 @@ if master_players:
 
     st.markdown("")
 
-    all_names = [p["name"] for p in master_players]
+    # all_names: everyone available as a partner/opponent — all master players + guests, sorted
+    all_names = sorted(
+        [p["name"] for p in master_players] +
+        [g["name"] for g in st.session_state.guests]
+    )
 
     # Table header
     h0, h1, h2, h3, h4, h5 = st.columns([0.5, 2, 1, 1.5, 1.5, 1.5])
@@ -1447,7 +1454,13 @@ if master_players:
     h5.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>OPPONENT (R1)</div>", unsafe_allow_html=True)
     st.markdown("<hr style='margin:4px 0 8px 0;border-color:#30363d;'>", unsafe_allow_html=True)
 
-    for p in master_players:
+    for row_idx, p in enumerate(master_players):
+        # Alternating row background
+        row_bg = "#161b22" if row_idx % 2 == 0 else "#1c2330"
+        st.markdown(
+            f"<div style='background:{row_bg};border-radius:6px;margin:1px 0;padding:2px 6px;'>",
+            unsafe_allow_html=True,
+        )
         c0, c1, c2, c3, c4, c5 = st.columns([0.5, 2, 1, 1.5, 1.5, 1.5])
 
         # Seed override dict from player defaults the first time we see this player
@@ -1478,45 +1491,60 @@ if master_players:
             ov["pref"] = new_pref
 
         with c4:
-            partner_opts = [""] + [n for n in all_names if n != p["name"]]
-            cur_partner = ov.get("partner", p["partner"]) or p["partner"]
-            partner_idx = partner_opts.index(cur_partner) if cur_partner in partner_opts else 0
-            new_partner = st.selectbox("", partner_opts,
-                index=partner_idx,
-                key=f"partner_{p['name']}", label_visibility="collapsed",
-            )
+            show_partner = new_pref == "Doubles"
+            if show_partner:
+                partner_opts = [""] + [n for n in all_names if n != p["name"]]
+                cur_partner = ov.get("partner", p["partner"]) or p["partner"]
+                partner_idx = partner_opts.index(cur_partner) if cur_partner in partner_opts else 0
+                new_partner = st.selectbox("", partner_opts,
+                    index=partner_idx,
+                    key=f"partner_{p['name']}", label_visibility="collapsed",
+                )
+            else:
+                new_partner = ""
+                st.markdown("<div style='padding-top:0.4rem;color:#4a5568;font-size:0.8rem;'>—</div>", unsafe_allow_html=True)
             ov["partner"] = new_partner
 
         with c5:
-            opp_opts = [""] + [n for n in all_names if n != p["name"]]
-            cur_opp = ov.get("opponent", "") or ""
-            opp_idx = opp_opts.index(cur_opp) if cur_opp in opp_opts else 0
-            new_opp = st.selectbox("", opp_opts,
-                index=opp_idx,
-                key=f"opp_{p['name']}", label_visibility="collapsed",
-            )
+            show_opponent = new_pref == "Singles"
+            if show_opponent:
+                opp_opts = [""] + [n for n in all_names if n != p["name"]]
+                cur_opp = ov.get("opponent", "") or ""
+                opp_idx = opp_opts.index(cur_opp) if cur_opp in opp_opts else 0
+                new_opp = st.selectbox("", opp_opts,
+                    index=opp_idx,
+                    key=f"opp_{p['name']}", label_visibility="collapsed",
+                )
+            else:
+                new_opp = ""
+                st.markdown("<div style='padding-top:0.4rem;color:#4a5568;font-size:0.8rem;'>—</div>", unsafe_allow_html=True)
+            ov["opponent"] = new_opp
             ov["opponent"] = new_opp
 
         st.session_state.overrides[p["name"]] = ov
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # Guest players
     st.markdown("---")
     st.markdown("### ➕ Add Guest Player")
 
-    # All names available for partner/opponent selection (master + already-added guests)
-    all_checked_names = [p["name"] for p in master_players if st.session_state.get(f"chk_{p['name']}", False)]
-    guest_name_opts = [""] + all_checked_names + [g["name"] for g in st.session_state.guests]
+    # Guest partner/opponent dropdowns use all_names (all master players + guests)
+    guest_name_opts = [""] + all_names
+
+    if "guest_add_counter" not in st.session_state:
+        st.session_state.guest_add_counter = 0
+    _gc = st.session_state.guest_add_counter
 
     g1, g2, g3, g4 = st.columns([2.5, 1.8, 1.8, 1.2])
     with g1:
         st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>NAME</div>", unsafe_allow_html=True)
-        guest_name = st.text_input("Name", key="guest_name", placeholder="First Last", label_visibility="collapsed")
+        guest_name = st.text_input("Name", key=f"guest_name_{_gc}", placeholder="First Last", label_visibility="collapsed")
     with g2:
         st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>LEVEL</div>", unsafe_allow_html=True)
-        guest_level = st.number_input("Level", min_value=1.0, max_value=7.0, value=3.5, step=0.5, key="guest_level", label_visibility="collapsed", format="%.1f")
+        guest_level = st.number_input("Level", min_value=1.0, max_value=7.0, value=3.5, step=0.5, key=f"guest_level_{_gc}", label_visibility="collapsed", format="%.1f")
     with g3:
         st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>PREFERENCE</div>", unsafe_allow_html=True)
-        guest_pref = st.selectbox("Preference", ["Either", "Singles", "Doubles"], key="guest_pref", label_visibility="collapsed")
+        guest_pref = st.selectbox("Preference", ["Either", "Singles", "Doubles"], key=f"guest_pref_{_gc}", label_visibility="collapsed")
     with g4:
         st.markdown("<div style='padding-bottom:4px;font-size:0.78rem;color:#4ade80;font-weight:600;'>&nbsp;</div>", unsafe_allow_html=True)
         if st.button("Add Guest", use_container_width=True):
@@ -1530,6 +1558,7 @@ if master_players:
                     "opponent": "",
                     "avoid": "",
                 })
+                st.session_state.guest_add_counter += 1  # resets the form fields
                 st.rerun()
 
     if st.session_state.guests:
@@ -1544,35 +1573,45 @@ if master_players:
         gh4.markdown("<div style='font-size:0.75rem;color:#4ade80;font-weight:600;'>OPPONENT (R1)</div>", unsafe_allow_html=True)
 
         for i, g in enumerate(st.session_state.guests):
-            # Options exclude the guest themselves
-            opts = [""] + all_checked_names + [gg["name"] for gg in st.session_state.guests if gg["name"] != g["name"]]
+            opts = [""] + [n for n in all_names if n != g["name"]]
             gc0, gc1, gc2, gc3, gc4, gc5 = st.columns([2.0, 1.2, 1.5, 2.0, 2.0, 0.8])
             with gc0:
                 st.markdown(f"<div style='padding-top:0.4rem;color:#e6edf3;font-weight:500;'>{g['name']}</div>", unsafe_allow_html=True)
             with gc1:
                 st.markdown(f"<div style='padding-top:0.4rem;color:#c9d1d9;'>{g['level']}</div>", unsafe_allow_html=True)
             with gc2:
-                st.markdown(f"<div style='padding-top:0.4rem;color:#c9d1d9;'>{g['pref']}</div>", unsafe_allow_html=True)
+                pref_opts = ["Either", "Singles", "Doubles"]
+                cur_gpref = g.get("pref", "Either")
+                new_gpref = st.selectbox("", pref_opts,
+                    index=pref_opts.index(cur_gpref) if cur_gpref in pref_opts else 0,
+                    key=f"gpref_{i}", label_visibility="collapsed")
+                g["pref"] = new_gpref
             with gc3:
-                cur_partner = g.get("partner", "")
-                partner_idx = opts.index(cur_partner) if cur_partner in opts else 0
-                new_partner = st.selectbox("", opts, index=partner_idx,
-                    key=f"gpartner_{i}", label_visibility="collapsed")
-                if new_partner != cur_partner:
-                    g["partner"] = new_partner
-                    # Set reverse link on the selected guest if they have no partner yet
-                    for other in st.session_state.guests:
-                        if other["name"] == new_partner and not other.get("partner"):
-                            other["partner"] = g["name"]
-                    st.rerun()
+                if new_gpref == "Doubles":
+                    cur_partner = g.get("partner", "")
+                    partner_idx = opts.index(cur_partner) if cur_partner in opts else 0
+                    new_partner = st.selectbox("", opts, index=partner_idx,
+                        key=f"gpartner_{i}", label_visibility="collapsed")
+                    if new_partner != cur_partner:
+                        g["partner"] = new_partner
+                        for other in st.session_state.guests:
+                            if other["name"] == new_partner and not other.get("partner"):
+                                other["partner"] = g["name"]
+                    else:
+                        g["partner"] = new_partner
+                else:
+                    g["partner"] = ""
+                    st.markdown("<div style='padding-top:0.4rem;color:#4a5568;font-size:0.8rem;'>—</div>", unsafe_allow_html=True)
             with gc4:
-                cur_opp = g.get("opponent", "")
-                opp_idx = opts.index(cur_opp) if cur_opp in opts else 0
-                new_opp = st.selectbox("", opts, index=opp_idx,
-                    key=f"gopp_{i}", label_visibility="collapsed")
-                if new_opp != cur_opp:
+                if new_gpref == "Singles":
+                    cur_opp = g.get("opponent", "")
+                    opp_idx = opts.index(cur_opp) if cur_opp in opts else 0
+                    new_opp = st.selectbox("", opts, index=opp_idx,
+                        key=f"gopp_{i}", label_visibility="collapsed")
                     g["opponent"] = new_opp
-                    st.rerun()
+                else:
+                    g["opponent"] = ""
+                    st.markdown("<div style='padding-top:0.4rem;color:#4a5568;font-size:0.8rem;'>—</div>", unsafe_allow_html=True)
             with gc5:
                 if st.button("✕", key=f"remove_guest_{i}"):
                     st.session_state.guests.pop(i)
@@ -1592,6 +1631,14 @@ if master_players:
                 "avoid": p["avoid"],
             })
     players.extend(st.session_state.guests)
+
+    # Enforce bidirectional partner links — if A has partner=B, ensure B also has partner=A
+    name_to_player = {p["name"]: p for p in players}
+    for p in players:
+        if p["partner"]:
+            other = name_to_player.get(p["partner"])
+            if other and not other["partner"]:
+                other["partner"] = p["name"]
 
     st.markdown("---")
 
@@ -1624,36 +1671,57 @@ if master_players:
                 st.caption(f"Click again for a different arrangement. (seed {st.session_state.seed})")
 
         if generate:
-            seed = st.session_state.seed
-            st.session_state.seed += 1
-            rng = random.Random(seed)
+            try:
+                seed = st.session_state.seed
+                st.session_state.seed += 1
+                rng = random.Random(seed)
 
-            r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys = assign_round1(players, rng=rng, max_courts=max_courts)
-            r1_courts, _ = render_schedule(r1_singles, r1_doubles, [], 1, balance_threshold)
+                r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys = assign_round1(players, rng=rng, max_courts=max_courts)
+                r1_courts, _ = render_schedule(r1_singles, r1_doubles, [], 1, balance_threshold)
 
-            r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts, balance_threshold=balance_threshold)
-            r2_courts, _ = render_schedule(r2_singles, r2_doubles, [], 2, balance_threshold)
+                r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts, balance_threshold=balance_threshold)
+                r2_courts, _ = render_schedule(r2_singles, r2_doubles, [], 2, balance_threshold)
 
-            r1_names = set()
-            for c in r1_courts:
-                for nm in c["display"].replace(" vs ", " & ").split(" & "):
-                    r1_names.add(nm.strip())
-            r1_names.update(p["name"] for p in r1_on_deck)
+                r1_names = set()
+                for c in r1_courts:
+                    for nm in c["display"].replace(" vs ", " & ").split(" & "):
+                        r1_names.add(nm.strip())
+                r1_names.update(p["name"] for p in r1_on_deck)
 
-            r2_names = set()
-            for c in r2_courts:
-                for nm in c["display"].replace(" vs ", " & ").split(" & "):
-                    r2_names.add(nm.strip())
-            r2_names.update(p["name"] for p in r2_on_deck)
+                r2_names = set()
+                for c in r2_courts:
+                    for nm in c["display"].replace(" vs ", " & ").split(" & "):
+                        r2_names.add(nm.strip())
+                r2_names.update(p["name"] for p in r2_on_deck)
 
-            all_names_set = set(p["name"] for p in players)
-            r1_missing = all_names_set - r1_names
-            r2_missing = all_names_set - r2_names
+                all_names_set = set(p["name"] for p in players)
+                r1_missing = all_names_set - r1_names
+                r2_missing = all_names_set - r2_names
 
-            if r1_missing or r2_missing:
-                st.markdown(f'<div class="warning-box">⚠️ Integrity check failed. Missing in R1: {r1_missing}. Missing in R2: {r2_missing}</div>', unsafe_allow_html=True)
+                st.session_state.schedule = {
+                    "r1_courts": r1_courts,
+                    "r2_courts": r2_courts,
+                    "r1_on_deck": r1_on_deck,
+                    "r2_on_deck": r2_on_deck,
+                    "r1_missing": r1_missing,
+                    "r2_missing": r2_missing,
+                    "n_players": len(players),
+                }
+            except Exception as e:
+                import traceback
+                st.markdown(f'<div class="warning-box">❌ Error generating schedule: {e}<br><pre>{traceback.format_exc()}</pre></div>', unsafe_allow_html=True)
+
+        if "schedule" in st.session_state and st.session_state.schedule:
+            sched = st.session_state.schedule
+            r1_courts = sched["r1_courts"]
+            r2_courts = sched["r2_courts"]
+            r1_on_deck = sched["r1_on_deck"]
+            r2_on_deck = sched["r2_on_deck"]
+
+            if sched["r1_missing"] or sched["r2_missing"]:
+                st.markdown(f'<div class="warning-box">⚠️ Integrity check failed. Missing in R1: {sched["r1_missing"]}. Missing in R2: {sched["r2_missing"]}</div>', unsafe_allow_html=True)
             else:
-                st.markdown(f'<div class="success-box">✅ All {len(players)} players accounted for in both rounds.</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="success-box">✅ All {sched["n_players"]} players accounted for in both rounds.</div>', unsafe_allow_html=True)
 
             col1, col2 = st.columns(2)
             with col1:
