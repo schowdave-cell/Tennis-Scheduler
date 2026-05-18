@@ -1340,7 +1340,7 @@ col_url, col_csv = st.columns([3, 2])
 
 with col_url:
     st.markdown("**🔗 Google Sheet URL**")
-    st.caption("Paste your sharing link — the app reads the Session and Master Players tabs automatically. Sheet must be shared as 'Anyone with the link can view'.")
+    st.caption("Paste your sharing link — the app reads the Master Players tabs automatically. Sheet must be shared as 'Anyone with the link can view'.")
     url_col, btn_col = st.columns([6, 1])
     with url_col:
         sheet_url_input = st.text_input(
