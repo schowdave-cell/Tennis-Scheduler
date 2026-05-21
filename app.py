@@ -218,12 +218,15 @@ h1, h2, h3 {
 /* Hide sidebar collapse/expand button — try all known selectors */
 [data-testid="collapsedControl"],
 [data-testid="baseButton-headerNoPadding"],
+[data-testid="stSidebarCollapseButton"],
 button[kind="header"],
-section[data-testid="stSidebar"] > div > button,
+section[data-testid="stSidebar"] > div > button:first-child,
 .st-emotion-cache-h4xjwg,
-.st-emotion-cache-1rtdyuf {
+.st-emotion-cache-1rtdyuf,
+.st-emotion-cache-1egp75f {
     display: none !important;
     visibility: hidden !important;
+    pointer-events: none !important;
 }
 
 .stButton > button:hover {
@@ -1235,9 +1238,6 @@ def load_master_players_cached(url):
             n = clean_str(str(row.get("Name", "")))
             if not n or len(n) > 50 or any(ord(c) > 127 for c in n):
                 continue
-            active = clean_str(find_col(row, "Active?", "Active")).lower()
-            if active == "no":
-                continue
             players.append({
                 "name": n,
                 "level": parse_level(str(row[level_col])),
@@ -1313,7 +1313,7 @@ def fetch_sheet_as_df(url, sheet_name="Session"):
 st.markdown("""
 <div class="hero">
     <h1>Tennis Drop-In Scheduler</h1>
-    <p>Connect your Google Sheet or upload a CSV → get balanced court assignments in seconds.</p>
+    <p>Connect your Google Sheet → get balanced court assignments in seconds.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1327,68 +1327,46 @@ with st.sidebar:
     if "schedule" not in st.session_state:
         st.session_state.schedule = None
 
-    max_courts = st.number_input("🎾 Number of courts available", min_value=1, max_value=20, value=10,
-        help="Maximum courts in use per round. If players exceed court capacity, all matches become doubles and overflow players are shown as On Deck.")
+    max_courts = st.number_input("🎾 Number of courts available", min_value=1, max_value=20, value=10, step=1, format="%d")
+    st.caption("Maximum courts per round. If players exceed capacity, all matches become doubles and overflow players are shown as On Deck.")
     balance_threshold = st.slider("⚖️ Balance warning threshold (rating gap)", min_value=0.0, max_value=2.0, value=0.5, step=0.25,
         help="Courts where the level gap exceeds this will show a warning flag. Does not affect scheduling.")
 
 # ── Unified data source section ──
-st.markdown("---")
 st.markdown("### 📡 Connect Your Player Data")
 
-col_url, col_csv = st.columns([3, 2])
+st.markdown("**🔗 Google Sheet URL**")
+st.caption("Paste your sharing link — the app reads the Master Players tab automatically. Sheet must be shared as 'Anyone with the link can view'.")
+url_col, btn_col = st.columns([6, 1])
+with url_col:
+    sheet_url_input = st.text_input(
+        "Google Sheet URL",
+        value=st.session_state.sheet_url,
+        placeholder="https://docs.google.com/spreadsheets/d/...",
+        label_visibility="collapsed",
+    )
+with btn_col:
+    load_clicked = st.button("Load", use_container_width=True)
 
-with col_url:
-    st.markdown("**🔗 Google Sheet URL**")
-    st.caption("Paste your sharing link — the app reads the Master Players tabs automatically. Sheet must be shared as 'Anyone with the link can view'.")
-    url_col, btn_col = st.columns([6, 1])
-    with url_col:
-        sheet_url_input = st.text_input(
-            "Google Sheet URL",
-            value=st.session_state.sheet_url,
-            placeholder="https://docs.google.com/spreadsheets/d/...",
-            label_visibility="collapsed",
-        )
-    with btn_col:
-        load_clicked = st.button("Load", use_container_width=True)
+if load_clicked and sheet_url_input:
+    st.session_state.sheet_url = sheet_url_input
+elif sheet_url_input != st.session_state.sheet_url:
+    st.session_state.sheet_url = sheet_url_input
 
-    if load_clicked and sheet_url_input:
-        st.session_state.sheet_url = sheet_url_input
-    elif sheet_url_input != st.session_state.sheet_url:
-        st.session_state.sheet_url = sheet_url_input
-
-    st.markdown("""
-    <div style="font-size:0.82rem; color:#8b949e; margin-top:0.5rem; line-height:1.6;">
-    Your sheet needs one tab:<br>
-    <b style="color:#c9d1d9;">Master Players</b> — Name, Level, Default Preference, Default Partner<br>
-    Player attendance and per-session overrides are managed in the app below.
-    </div>
-    """, unsafe_allow_html=True)
-
-with col_csv:
-    st.markdown("**📋 Or Upload a CSV**")
-    st.caption("Need a sample? Download one to get started.")
-    sample_data = pd.DataFrame([
-        {"Name": "Alice", "Level": 3.5, "Preference": "Doubles", "Partner": "Beth", "Opponent": "", "Avoid": ""},
-        {"Name": "Beth", "Level": 5.0, "Preference": "Doubles", "Partner": "Alice", "Opponent": "", "Avoid": ""},
-        {"Name": "Carl", "Level": 4.0, "Preference": "Singles", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Dave", "Level": 4.0, "Preference": "Singles", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Evan", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Frank", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Grace", "Level": 3.5, "Preference": "Doubles", "Partner": "Heidi", "Opponent": "", "Avoid": ""},
-        {"Name": "Heidi", "Level": 3.5, "Preference": "Doubles", "Partner": "Grace", "Opponent": "", "Avoid": ""},
-        {"Name": "Ivan", "Level": 4.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
-        {"Name": "Jack", "Level": 3.0, "Preference": "Either", "Partner": "", "Opponent": "", "Avoid": ""},
-    ])
-    csv_bytes = sample_data.to_csv(index=False).encode()
-    st.download_button("📥 Download Sample CSV", data=csv_bytes, file_name="sample_players.csv", mime="text/csv")
-    uploaded_csv = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed")
+st.markdown("""
+<div style="font-size:0.82rem; color:#8b949e; margin-top:0.5rem; line-height:1.6;">
+Your sheet needs one tab:<br>
+<b style="color:#c9d1d9;">Master Players</b> — Name, Level, Default Preference, Default Partner<br>
+Player attendance and per-session overrides are managed in the app below.
+</div>
+""", unsafe_allow_html=True)
 
 st.markdown("---")
 
 # ── Load master players ──
 master_players = []
 source_label = None
+uploaded_csv = None
 
 if st.session_state.sheet_url:
     try:
@@ -1396,15 +1374,6 @@ if st.session_state.sheet_url:
         source_label = f"📊 {len(master_players)} players loaded from Google Sheet"
     except Exception as e:
         st.markdown(f'<div class="warning-box">❌ Could not load Master Players tab: {e}</div>', unsafe_allow_html=True)
-
-elif uploaded_csv:
-    try:
-        df_csv = pd.read_csv(uploaded_csv)
-        master_players = load_players(df_csv)
-        master_players.sort(key=lambda p: p["name"].lower())
-        source_label = f"📁 {len(master_players)} players loaded from CSV"
-    except Exception as e:
-        st.markdown(f'<div class="warning-box">❌ Error reading CSV: {e}</div>', unsafe_allow_html=True)
 
 # ── Session manager ──
 if master_players:
@@ -1444,15 +1413,29 @@ if master_players:
         [g["name"] for g in st.session_state.guests]
     )
 
-    # Table header
+    # Table header — marked with a unique sentinel div so JS can find and stick it
+    st.markdown("<div id='player-table-header-sentinel'></div>", unsafe_allow_html=True)
     h0, h1, h2, h3, h4, h5 = st.columns([0.5, 2, 1, 1.5, 1.5, 1.5])
     h0.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>IN</div>", unsafe_allow_html=True)
     h1.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>NAME</div>", unsafe_allow_html=True)
     h2.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>LEVEL</div>", unsafe_allow_html=True)
     h3.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>PREFERENCE</div>", unsafe_allow_html=True)
-    h4.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>PARTNER</div>", unsafe_allow_html=True)
-    h5.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>OPPONENT (R1)</div>", unsafe_allow_html=True)
-    st.markdown("<hr style='margin:4px 0 8px 0;border-color:#30363d;'>", unsafe_allow_html=True)
+    h4.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>PARTNER PREFERENCE</div>", unsafe_allow_html=True)
+    h5.markdown("<div style='font-size:0.78rem;color:#4ade80;font-weight:600;'>OPPONENT PREFERENCE (R1)</div>", unsafe_allow_html=True)
+    st.markdown("""
+    <style>
+    /* Sticky player table header */
+    #player-table-header-sentinel ~ div [data-testid="stHorizontalBlock"]:first-of-type {
+        position: sticky;
+        top: 2.75rem;
+        z-index: 99;
+        background: #0d1117;
+        padding-bottom: 6px;
+        border-bottom: 1px solid #30363d;
+    }
+    </style>
+    <hr style='margin:4px 0 8px 0;border-color:#30363d;'>
+    """, unsafe_allow_html=True)
 
     for row_idx, p in enumerate(master_players):
         # Alternating row background
