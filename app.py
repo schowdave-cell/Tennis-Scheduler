@@ -591,8 +591,10 @@ def form_teams(pool, rng=None, r1_rng=None, avoid_partners=None):
                 best_teams = candidate_teams
                 best_leftover = [candidate_leftover]
 
-        # Among equally-scored options, r1_rng picks randomly
+        # Among options within a small tolerance of best score, r1_rng picks randomly
+        # This prevents the same isolated-level player from always sitting out
         if r1_rng:
+            tolerance = 0.5  # accept sit-outs within 0.5 of the best balance score
             best_options = []
             for sit_out_idx in range(len(unpaired)):
                 candidate_leftover = unpaired[sit_out_idx]
@@ -600,7 +602,7 @@ def form_teams(pool, rng=None, r1_rng=None, avoid_partners=None):
                 pool_sorted = sorted(candidate_pool, key=lambda x: x["level"])
                 score = sum(abs(pool_sorted[i]["level"] - pool_sorted[i+1]["level"])
                            for i in range(0, len(pool_sorted)-1, 2))
-                if abs(score - best_score) < 0.001:
+                if score <= best_score + tolerance:
                     best_options.append(sit_out_idx)
             sit_out_idx = r1_rng.choice(best_options)
             best_leftover = [unpaired[sit_out_idx]]
@@ -654,13 +656,8 @@ def optimal_match_teams(teams, rng=None):
     leftover_teams = []
     if len(remaining) % 2 == 1:
         if rng:
-            # Pick randomly among the middle third of teams by level to keep balance
-            # while still rotating who sits out
-            remaining_sorted = sorted(remaining, key=lambda t: avg_level(t))
-            n = len(remaining_sorted)
-            lo, hi = max(0, n//3), min(n-1, 2*n//3)
-            sit_out_idx = rng.randint(lo, hi)
-            sit_out = remaining_sorted[sit_out_idx]
+            # Pick any team randomly so sit-outs rotate fairly across all players
+            sit_out = rng.choice(remaining)
             remaining = [t for t in remaining if t is not sit_out]
             leftover_teams = [sit_out]
         else:
@@ -773,12 +770,13 @@ def make_doubles_matches(pool, fixed_partners, rng=None, r1_rng=None, avoid_matc
     leftover = [p for team in leftover_teams for p in team] + leftover_players
     return matches, leftover
 
-def make_singles_matches(pool, avoid_keys=None):
+def make_singles_matches(pool, avoid_keys=None, presorted=False):
     """Form singles matches from pool. Returns matches and leftover.
     avoid_keys: set of frozensets of player name pairs to avoid repeating.
+    presorted: if True, use pool order as-is (caller already shuffled); don't re-sort by level.
     """
     avoid_keys = avoid_keys or set()
-    sorted_pool = sorted(pool, key=lambda x: x["level"])
+    sorted_pool = list(pool) if presorted else sorted(pool, key=lambda x: x["level"])
     matches = []
     remaining = list(sorted_pool)
 
@@ -887,10 +885,13 @@ def assign_round1(players, rng=None, max_courts=None):
         # Combine all leftovers and try singles before on_deck
         all_leftover = s_leftover + d_leftover
         if all_leftover:
+            # Shuffle with rng so the same player doesn't always end up in singles/on deck
+            if rng:
+                rng.shuffle(all_leftover)
             # Players with a fixed partner must never play singles — send them on deck
             singles_eligible = [p for p in all_leftover if not p["partner"]]
             forced_deck = [p for p in all_leftover if p["partner"]]
-            extra_s, extra_bye = make_singles_matches(singles_eligible)
+            extra_s, extra_bye = make_singles_matches(singles_eligible, presorted=True)
             singles_matches.extend(extra_s)
             for m in extra_s:
                 used.add(m[0]["name"])
@@ -1133,7 +1134,7 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
             rng.shuffle(all_leftover)
             singles_eligible = [p for p in all_leftover if not p["partner"]]
             forced_deck = [p for p in all_leftover if p["partner"]]
-            extra_s, extra_bye = make_singles_matches(singles_eligible, avoid_keys=r1_singles_keys or set())
+            extra_s, extra_bye = make_singles_matches(singles_eligible, avoid_keys=r1_singles_keys or set(), presorted=True)
             singles_matches.extend(extra_s)
             for m in extra_s:
                 used.add(m[0]["name"])
