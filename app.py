@@ -1351,6 +1351,7 @@ with btn_col:
 
 if load_clicked and sheet_url_input:
     st.session_state.sheet_url = sheet_url_input
+    load_master_players_cached.clear()  # bust cache so latest sheet data is fetched
 elif sheet_url_input != st.session_state.sheet_url:
     st.session_state.sheet_url = sheet_url_input
 
