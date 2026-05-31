@@ -854,9 +854,9 @@ def assign_round1(players, rng=None, max_courts=None):
     used = set()
     singles_matches = []
     doubles_matches = []
+    r1_pulled_for_singles = set()
 
     if not force_all_doubles:
-        # Normal flow: fixed opponent singles → singles-only → doubles
         for p in active_players:
             if p["name"] in used or not p["opponent"]:
                 continue
@@ -872,7 +872,31 @@ def assign_round1(players, rng=None, max_courts=None):
         for m in s_matches:
             used.add(m[0]["name"])
             used.add(m[1]["name"])
-        # Don't put singles leftovers on deck yet — hold for pairing with doubles leftovers
+
+        # If there's an odd singles-only player left over, pull the closest-level
+        # Either player to pair with them rather than leaving them on deck.
+        # Use rng to rotate among equally-close candidates so it varies each click.
+        r1_pulled_for_singles = set()
+        if len(s_leftover) == 1:
+            lone = s_leftover[0]
+            either_candidates = [p for p in active_players
+                                 if p["name"] not in used
+                                 and p["pref"] == "Either"
+                                 and not p["partner"]]
+            if either_candidates:
+                # Shuffle first with rng so rotation happens, then pick best from shuffled order
+                if rng:
+                    rng.shuffle(either_candidates)
+                # Among all candidates within 1.0 level gap, pick randomly via shuffled order
+                lone_level = lone["level"]
+                within_threshold = [e for e in either_candidates if abs(e["level"] - lone_level) <= 1.0]
+                pool = within_threshold if within_threshold else either_candidates
+                pulled = pool[0]  # first after shuffle = random within threshold
+                singles_matches.append((lone, pulled))
+                used.add(lone["name"])
+                used.add(pulled["name"])
+                r1_pulled_for_singles.add(pulled["name"])
+                s_leftover = []
 
         doubles_pool = [p for p in active_players if p["name"] not in used and p not in s_leftover]
         d_matches, d_leftover = make_doubles_matches(doubles_pool, {}, rng=None, r1_rng=rng)
@@ -882,15 +906,12 @@ def assign_round1(players, rng=None, max_courts=None):
                 for pl in t:
                     used.add(pl["name"])
 
-        # Combine all leftovers and try singles before on_deck
         all_leftover = s_leftover + d_leftover
         if all_leftover:
-            # Shuffle with rng so the same player doesn't always end up in singles/on deck
             if rng:
                 rng.shuffle(all_leftover)
-            # Players with a fixed partner must never play singles — send them on deck
-            singles_eligible = [p for p in all_leftover if not p["partner"]]
-            forced_deck = [p for p in all_leftover if p["partner"]]
+            singles_eligible = [p for p in all_leftover if not p["partner"] and p["pref"] != "Doubles"]
+            forced_deck = [p for p in all_leftover if p["partner"] or p["pref"] == "Doubles"]
             extra_s, extra_bye = make_singles_matches(singles_eligible, presorted=True)
             singles_matches.extend(extra_s)
             for m in extra_s:
@@ -921,10 +942,10 @@ def assign_round1(players, rng=None, max_courts=None):
     # Track singles matchups to detect repeats in Round 2
     r1_singles_keys = {frozenset([m[0]["name"], m[1]["name"]]) for m in singles_matches}
 
-    return singles_matches, doubles_matches, on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys
+    return singles_matches, doubles_matches, on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys, r1_pulled_for_singles
 
 
-def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_threshold, max_courts, current_doubles_courts, non_singles_count=None, rng=None):
+def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_threshold, max_courts, current_doubles_courts, non_singles_count=None, rng=None, r1_pulled_for_singles=None):
     """
     Decide how to handle singles in Round 2 to avoid R1 repeat matchups.
 
@@ -1043,7 +1064,24 @@ def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_thres
 
         return new_singles, pulled
 
-    # --- Odd number (1 or 3): just match what we can, leftover handled by caller ---
+    # --- Exactly 1 singles player: pull closest Either player to pair with them ---
+    if n == 1:
+        p1 = singles_players[0]
+        avoid = r1_pulled_for_singles or set()
+        available = [e for e in either_pool if e["name"] not in avoid]
+        if not available:
+            available = list(either_pool)
+        if not available:
+            return [], []
+        if rng:
+            rng.shuffle(available)
+        # Pick from those within 1.0 level gap; shuffle already randomized order
+        within_threshold = [e for e in available if abs(e["level"] - p1["level"]) <= 1.0]
+        pool = within_threshold if within_threshold else available
+        either_a = pool[0]
+        return [(p1, either_a)], [either_a]
+
+    # --- Odd number (3+): match what we can, leftover handled by caller ---
     sorted_s = sorted(singles_players, key=lambda x: x["level"])
     matches = []
     for i in range(0, len(sorted_s) - 1, 2):
@@ -1052,7 +1090,7 @@ def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_thres
 
 
 def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
-                  r1_singles_keys=None, max_courts=None, balance_threshold=0.5):
+                  r1_singles_keys=None, max_courts=None, balance_threshold=0.5, r1_pulled_for_singles=None):
     """
     Round 2: reshuffle avoiding R1 repeat matchups.
     Singles repeat-avoidance:
@@ -1090,7 +1128,7 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
     if not force_all_doubles:
         singles_pool = [p for p in active_players if p["pref"] == "Singles" and not p["partner"]]
         either_pool = [p for p in active_players
-                       if p["pref"] in ("Either", "Doubles") and not p["partner"]]
+                       if p["pref"] == "Either" and not p["partner"]]
 
         # How many non-singles players exist (the doubles pool before any pulling)
         # Players with a fixed partner always play doubles even if pref=Singles
@@ -1100,7 +1138,8 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
 
         r2_singles, pulled_either = plan_r2_singles(
             singles_pool, either_pool, r1_singles_keys or set(),
-            balance_threshold, max_courts, current_doubles_courts, non_singles_count, rng=rng
+            balance_threshold, max_courts, current_doubles_courts, non_singles_count, rng=rng,
+            r1_pulled_for_singles=r1_pulled_for_singles or set()
         )
 
         singles_matches.extend(r2_singles)
@@ -1132,8 +1171,8 @@ def assign_round2(players, rng, r1_matchup_keys=None, r1_partner_pairs=None,
         all_leftover = s_leftover + d_leftover
         if all_leftover:
             rng.shuffle(all_leftover)
-            singles_eligible = [p for p in all_leftover if not p["partner"]]
-            forced_deck = [p for p in all_leftover if p["partner"]]
+            singles_eligible = [p for p in all_leftover if not p["partner"] and p["pref"] != "Doubles"]
+            forced_deck = [p for p in all_leftover if p["partner"] or p["pref"] == "Doubles"]
             extra_s, extra_bye = make_singles_matches(singles_eligible, avoid_keys=r1_singles_keys or set(), presorted=True)
             singles_matches.extend(extra_s)
             for m in extra_s:
@@ -1661,10 +1700,10 @@ if master_players:
                 st.session_state.seed += 1
                 rng = random.Random(seed)
 
-                r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys = assign_round1(players, rng=rng, max_courts=max_courts)
+                r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys, r1_pulled_for_singles = assign_round1(players, rng=rng, max_courts=max_courts)
                 r1_courts, _ = render_schedule(r1_singles, r1_doubles, [], 1, balance_threshold)
 
-                r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts, balance_threshold=balance_threshold)
+                r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts, balance_threshold=balance_threshold, r1_pulled_for_singles=r1_pulled_for_singles)
                 r2_courts, _ = render_schedule(r2_singles, r2_doubles, [], 2, balance_threshold)
 
                 r1_names = set()
