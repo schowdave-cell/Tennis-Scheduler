@@ -817,7 +817,7 @@ def players_needed(n_singles, n_doubles):
     return n_singles * 2 + n_doubles * 4
 
 
-def assign_round1(players, rng=None, max_courts=None):
+def assign_round1(players, rng=None, max_courts=None, balance_threshold=0.5):
     """
     Round 1 scheduling with optional court limit.
     If court limit forces sit-outs, all matches become doubles to maximize court usage.
@@ -867,16 +867,57 @@ def assign_round1(players, rng=None, max_courts=None):
                 used.add(opp["name"])
 
         singles_pool = [p for p in active_players if p["pref"] == "Singles" and p["name"] not in used and not p["partner"]]
-        s_matches, s_leftover = make_singles_matches(singles_pool)
+        either_available = [p for p in active_players if p["pref"] == "Either" and p["name"] not in used and not p["partner"]]
+
+        # Check if any natural singles pairing exceeds balance_threshold.
+        # If so, swap in a closer-level Either player for each imbalanced match.
+        s_matches_raw, s_leftover = make_singles_matches(singles_pool)
+        s_matches = []
+        r1_pulled_for_singles = set()
+        if rng:
+            rng.shuffle(either_available)
+
+        for p1, p2 in s_matches_raw:
+            gap = abs(p1["level"] - p2["level"])
+            if gap <= balance_threshold:
+                # Pairing is fine, keep as-is
+                s_matches.append((p1, p2))
+            else:
+                # Find Either players within threshold of each singles player
+                close_to_p1 = [e for e in either_available
+                               if e["name"] not in r1_pulled_for_singles
+                               and abs(e["level"] - p1["level"]) <= balance_threshold]
+                close_to_p2 = [e for e in either_available
+                               if e["name"] not in r1_pulled_for_singles
+                               and abs(e["level"] - p2["level"]) <= balance_threshold]
+
+                # Need two distinct Either players, one for each singles player
+                e1 = close_to_p1[0] if close_to_p1 else None
+                close_to_p2_filtered = [e for e in close_to_p2 if e1 is None or e["name"] != e1["name"]]
+                e2 = close_to_p2_filtered[0] if close_to_p2_filtered else None
+
+                if e1 and e2:
+                    # Both singles players get a well-matched Either opponent
+                    s_matches.append((p1, e1))
+                    s_matches.append((p2, e2))
+                    r1_pulled_for_singles.add(e1["name"])
+                    r1_pulled_for_singles.add(e2["name"])
+                    either_available = [e for e in either_available
+                                       if e["name"] not in {e1["name"], e2["name"]}]
+                else:
+                    # No suitable swap found — keep original pairing, warning flag will show
+                    s_matches.append((p1, p2))
+
         singles_matches.extend(s_matches)
         for m in s_matches:
             used.add(m[0]["name"])
             used.add(m[1]["name"])
+        for name in r1_pulled_for_singles:
+            used.add(name)
 
         # If there's an odd singles-only player left over, pull the closest-level
         # Either player to pair with them rather than leaving them on deck.
         # Use rng to rotate among equally-close candidates so it varies each click.
-        r1_pulled_for_singles = set()
         if len(s_leftover) == 1:
             lone = s_leftover[0]
             either_candidates = [p for p in active_players
@@ -884,14 +925,12 @@ def assign_round1(players, rng=None, max_courts=None):
                                  and p["pref"] == "Either"
                                  and not p["partner"]]
             if either_candidates:
-                # Shuffle first with rng so rotation happens, then pick best from shuffled order
                 if rng:
                     rng.shuffle(either_candidates)
-                # Among all candidates within 1.0 level gap, pick randomly via shuffled order
                 lone_level = lone["level"]
-                within_threshold = [e for e in either_candidates if abs(e["level"] - lone_level) <= 1.0]
+                within_threshold = [e for e in either_candidates if abs(e["level"] - lone_level) <= balance_threshold]
                 pool = within_threshold if within_threshold else either_candidates
-                pulled = pool[0]  # first after shuffle = random within threshold
+                pulled = pool[0]
                 singles_matches.append((lone, pulled))
                 used.add(lone["name"])
                 used.add(pulled["name"])
@@ -899,6 +938,91 @@ def assign_round1(players, rng=None, max_courts=None):
                 s_leftover = []
 
         doubles_pool = [p for p in active_players if p["name"] not in used and p not in s_leftover]
+
+        # If doubles pool doesn't divide evenly by 4, fix it proactively:
+        # remainder==2: pull 2 Either players into a singles match
+        # remainder==3: move 3 players out — 2 into singles + 1 on deck, OR just 1 on deck if no valid singles pair
+        # remainder==1: put 1 player on deck (prefer non-Either so Either players stay available)
+        remainder = len(doubles_pool) % 4
+        if remainder == 2:
+            either_for_singles = [p for p in doubles_pool
+                                  if p["pref"] == "Either" and not p["partner"]]
+            if rng:
+                rng.shuffle(either_for_singles)
+            if len(either_for_singles) >= 2:
+                best_pair = None
+                best_gap = float("inf")
+                for i in range(len(either_for_singles)):
+                    for j in range(i + 1, len(either_for_singles)):
+                        gap = abs(either_for_singles[i]["level"] - either_for_singles[j]["level"])
+                        if gap <= balance_threshold and gap < best_gap:
+                            best_gap = gap
+                            best_pair = (either_for_singles[i], either_for_singles[j])
+                if best_pair:
+                    p1, p2 = best_pair
+                    singles_matches.append((p1, p2))
+                    used.add(p1["name"])
+                    used.add(p2["name"])
+                    doubles_pool = [p for p in doubles_pool if p["name"] not in used]
+
+        elif remainder == 3:
+            # Try pulling 2 Either players into singles + 1 on deck
+            either_for_singles = [p for p in doubles_pool
+                                  if p["pref"] == "Either" and not p["partner"]]
+            if rng:
+                rng.shuffle(either_for_singles)
+            best_pair = None
+            best_gap = float("inf")
+            for i in range(len(either_for_singles)):
+                for j in range(i + 1, len(either_for_singles)):
+                    gap = abs(either_for_singles[i]["level"] - either_for_singles[j]["level"])
+                    if gap <= balance_threshold and gap < best_gap:
+                        best_gap = gap
+                        best_pair = (either_for_singles[i], either_for_singles[j])
+            if best_pair:
+                p1, p2 = best_pair
+                singles_matches.append((p1, p2))
+                used.add(p1["name"])
+                used.add(p2["name"])
+                doubles_pool = [p for p in doubles_pool if p["name"] not in used]
+                # Now remainder==1 — pick 1 player to sit out (prefer Doubles-only)
+                deck_candidates = sorted(doubles_pool,
+                    key=lambda p: (0 if p["pref"] == "Doubles" else 1, 0 if not p["partner"] else 1))
+                if deck_candidates:
+                    deck_player = deck_candidates[0]
+                    on_deck.append(deck_player)
+                    used.add(deck_player["name"])
+                    doubles_pool = [p for p in doubles_pool if p["name"] != deck_player["name"]]
+            else:
+                # No valid singles pair — just put 1 player on deck
+                deck_candidates = sorted(doubles_pool,
+                    key=lambda p: (0 if p["pref"] == "Doubles" else 1))
+                if rng:
+                    # Shuffle within same-preference groups for rotation
+                    doubles_pref = [p for p in deck_candidates if p["pref"] == "Doubles"]
+                    either_pref = [p for p in deck_candidates if p["pref"] != "Doubles"]
+                    if rng and doubles_pref:
+                        rng.shuffle(doubles_pref)
+                    deck_candidates = doubles_pref + either_pref
+                if deck_candidates:
+                    deck_player = deck_candidates[0]
+                    on_deck.append(deck_player)
+                    used.add(deck_player["name"])
+                    doubles_pool = [p for p in doubles_pool if p["name"] != deck_player["name"]]
+
+        elif remainder == 1:
+            # Put 1 player on deck — prefer Doubles-only to preserve Either players
+            deck_candidates = [p for p in doubles_pool if p["pref"] == "Doubles" and not p["partner"]]
+            if not deck_candidates:
+                deck_candidates = [p for p in doubles_pool if not p["partner"]]
+            if rng and deck_candidates:
+                rng.shuffle(deck_candidates)
+            if deck_candidates:
+                deck_player = deck_candidates[0]
+                on_deck.append(deck_player)
+                used.add(deck_player["name"])
+                doubles_pool = [p for p in doubles_pool if p["name"] != deck_player["name"]]
+
         d_matches, d_leftover = make_doubles_matches(doubles_pool, {}, rng=None, r1_rng=rng)
         doubles_matches.extend(d_matches)
         for m in d_matches:
@@ -1012,8 +1136,9 @@ def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_thres
     if n == 2:
         p1, p2 = singles_players
         would_repeat = frozenset([p1["name"], p2["name"]]) in r1_singles_keys
+        gap_too_large = abs(p1["level"] - p2["level"]) > balance_threshold
 
-        if not would_repeat:
+        if not would_repeat and not gap_too_large:
             return [(p1, p2)], []
 
         # non_singles_count is the number of non-singles players (the raw doubles pool).
@@ -1034,12 +1159,18 @@ def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_thres
         if rng:
             rng.shuffle(available)
 
-        # Always pick the closest-level Either player for p1, then for p2
-        available.sort(key=lambda e: abs(e["level"] - p1["level"]))
-        either_a = available.pop(0)
+        # Pick closest-level Either player within threshold for p1, then p2
+        within_p1 = [e for e in available if abs(e["level"] - p1["level"]) <= balance_threshold]
+        pool_p1 = within_p1 if within_p1 else available
+        pool_p1.sort(key=lambda e: abs(e["level"] - p1["level"]))
+        either_a = pool_p1[0]
+        available = [e for e in available if e["name"] != either_a["name"]]
 
-        available.sort(key=lambda e: abs(e["level"] - p2["level"]))
-        either_b = available.pop(0)
+        within_p2 = [e for e in available if abs(e["level"] - p2["level"]) <= balance_threshold]
+        pool_p2 = within_p2 if within_p2 else available
+        pool_p2.sort(key=lambda e: abs(e["level"] - p2["level"]))
+        either_b = pool_p2[0]
+        available = [e for e in available if e["name"] != either_b["name"]]
 
         new_singles = [(p1, either_a), (p2, either_b)]
         pulled = [either_a, either_b]
@@ -1075,8 +1206,7 @@ def plan_r2_singles(singles_players, either_pool, r1_singles_keys, balance_thres
             return [], []
         if rng:
             rng.shuffle(available)
-        # Pick from those within 1.0 level gap; shuffle already randomized order
-        within_threshold = [e for e in available if abs(e["level"] - p1["level"]) <= 1.0]
+        within_threshold = [e for e in available if abs(e["level"] - p1["level"]) <= balance_threshold]
         pool = within_threshold if within_threshold else available
         either_a = pool[0]
         return [(p1, either_a)], [either_a]
@@ -1700,7 +1830,7 @@ if master_players:
                 st.session_state.seed += 1
                 rng = random.Random(seed)
 
-                r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys, r1_pulled_for_singles = assign_round1(players, rng=rng, max_courts=max_courts)
+                r1_singles, r1_doubles, r1_on_deck, r1_matchup_keys, r1_partner_pairs, r1_singles_keys, r1_pulled_for_singles = assign_round1(players, rng=rng, max_courts=max_courts, balance_threshold=balance_threshold)
                 r1_courts, _ = render_schedule(r1_singles, r1_doubles, [], 1, balance_threshold)
 
                 r2_singles, r2_doubles, r2_on_deck = assign_round2(players, rng, r1_matchup_keys, r1_partner_pairs, r1_singles_keys=r1_singles_keys, max_courts=max_courts, balance_threshold=balance_threshold, r1_pulled_for_singles=r1_pulled_for_singles)
